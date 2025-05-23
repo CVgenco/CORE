@@ -1,0 +1,1937 @@
+%% Nodal+Subhourly Electricity Price Model
+% Implementation of enhanced electricity price simulation model for
+% nodal pricing data at subhourly resolution with hourly constraint enforcement.
+%
+% This model extends the existing electricity price simulation framework to:
+% 1. Handle variable resolution subhourly data (5, 15, or 30 min intervals)
+% 2. Extract and model node-specific patterns and hub-node relationships
+% 3. Implement bidirectional mapping between hourly and subhourly resolutions
+% 4. Enhance jump-diffusion modeling for nodal market characteristics
+% 5. Enforce precise hourly constraints while preserving realistic dynamics
+
+clear; close all; clc;
+
+% Set fixed random seed for reproducibility
+rng(42);
+
+% Create a parallel pool with maximum available workers
+if isempty(gcp('nocreate')) % Check for existing parallel pool without creating one
+    parpool('local');
+end
+
+% Create parallel random stream constant for substreams
+s = RandStream('Threefry'); % Use Threefry algorithm which supports substreams well
+sc = parallel.pool.Constant(s);
+
+%% === USER-PROVIDED FILE PATHS & CONFIGURATION ===
+% Historical data files
+histNodalFile = '/Users/chayanvohra/Downloads/Energy Price & Risk Simulator/Price Forecaster/CORE/historical_nodal_prices.csv';
+histHubFile = '/Users/chayanvohra/Downloads/Energy Price & Risk Simulator/Price Forecaster/CORE/historical_hub_prices.csv';
+histGenFile = '/Users/chayanvohra/Downloads/Energy Price & Risk Simulator/Price Forecaster/CORE/historical_nodal_generation.csv';
+
+% Ancillary services historical data files
+histAncillaryFiles = struct(...
+    'NonSpin', '/Users/chayanvohra/Downloads/Energy Price & Risk Simulator/Price Forecaster/CORE/historical_nonspin.csv', ...
+    'RegDown', '/Users/chayanvohra/Downloads/Energy Price & Risk Simulator/Price Forecaster/CORE/historical_regdown.csv', ...
+    'RegUp', '/Users/chayanvohra/Downloads/Energy Price & Risk Simulator/Price Forecaster/CORE/historical_regup.csv', ...
+    'RRS', 'historical_rrs.csv', ...
+    'ECRS', 'historical_ecrs.csv');
+
+% Forecast data files
+forecastNodalFile = '/Users/chayanvohra/Downloads/Energy Price & Risk Simulator/Price Forecaster/CORE/hourly_nodal_forecasts.csv';
+forecastHubFile = '/Users/chayanvohra/Downloads/Energy Price & Risk Simulator/Price Forecaster/CORE/hourly_hub_forecasts.csv';
+forecastAncillaryFile = '/Users/chayanvohra/Downloads/Energy Price & Risk Simulator/Price Forecaster/CORE/forecasted_annual_ancillary.csv';
+
+% Output file
+outputFile = 'nodal_subhourly_paths.csv';
+
+% Configuration parameters
+nPaths = 10;          % Monte Carlo paths (user-tunable)
+nNodes = 1;            % Number of nodes to simulate
+
+% Enhanced configuration parameters
+dataPreprocessing = struct(...
+    'variable_resolution', true, ...    % Enable variable resolution support
+    'synchronization', true, ...        % Enable nodal-hub synchronization
+    'extreme_filtering', true, ...      % Enable specialized filtering for nodal extremes
+    'quality_checks', true);            % Enable data quality verification
+
+nodalPatterns = struct(...
+    'hub_node_modeling', true, ...      % Enable hub-node relationship modeling
+    'volatility_patterns', true, ...    % Enable node-specific volatility modeling
+    'congestion_detection', true, ...   % Enable congestion pattern recognition
+    'basis_differential', true);        % Enable basis differential analysis
+
+resolutionMapping = struct(...
+    'bidirectional_conversion', true, ...  % Enable hourly-subhourly conversion
+    'constraint_formulation', true, ...    % Enable mathematical constraint formulation
+    'microstructure_preservation', true);  % Enable preservation of market microstructure
+
+jumpDiffusion = struct(...
+    'node_specific_calibration', true, ... % Enable node-specific jump calibration
+    'asymmetric_jumps', true, ...         % Enable separate pos/neg jump modeling
+    'transmission_constraints', true, ...  % Enable transmission constraint effects
+    'congestion_price_formation', true);   % Enable congestion-driven price modeling
+
+constraintEnforcement = struct(...
+    'mathematical_guarantees', true, ...   % Enable exact hourly constraint satisfaction
+    'volatility_preservation', true, ...   % Enable volatility structure preservation
+    'adaptive_scaling', true, ...          % Enable context-sensitive scaling
+    'precision_target', 0.0001);           % Target precision for hourly average (0.01%)
+
+%% ==================== 1. DATA PREPROCESSING MODULE ====================
+fprintf('Starting data preprocessing module...\n');
+
+%% 1.1 - Load and parse historical nodal price data
+fprintf('Loading historical nodal price data from: %s\n', histNodalFile);
+assert(isfile(histNodalFile), 'Historical nodal price file not found: %s', histNodalFile);
+
+% Function: parseVariableResolutionData
+% Detects and processes data with variable time intervals (5, 15, or 30 min)
+function [data, resolution] = parseVariableResolutionData(filename)
+    % Read everything as text for robust timestamp parsing
+    opts = detectImportOptions(filename, 'Delimiter', ',');
+    opts = setvartype(opts, 'Timestamp', 'char');
+    T = readtable(filename, opts);
+    T = rmmissing(T);  % drop any rows with missing values
+    
+    % Try multiple timestamp formats
+    tsFormats = { ...
+        'M/d/yy H:mm', ...
+        'MM/dd/yy HH:mm:ss', ...
+        'yyyy-MM-dd HH:mm:ss', ...
+        'M/d/yyyy H:mm', ...
+        'dd/MM/yyyy HH:mm' ...  % Added support for DD/MM/YYYY HH:MM format
+        };
+    ts = [];
+    for fmt = tsFormats
+        try
+            dt = datetime(T.Timestamp, 'InputFormat', fmt{1}, 'Locale', 'en_US');
+            if all(~isnat(dt))
+                ts = dt;
+                fprintf(' → Parsed timestamps with "%s"\n', fmt{1});
+                break;
+            end
+        catch
+            % Try next format
+        end
+    end
+    assert(~isempty(ts), 'Failed to parse timestamps.');
+    
+    % Fix two-digit years
+    idxY = year(ts) < 100;
+    ts(idxY) = ts(idxY) + years(2000);
+    
+    % Handle duplicate timestamps - Optimized for large datasets
+    [uniqueTs, ia, ic] = unique(ts);
+    if length(uniqueTs) < length(ts)
+        fprintf(' → Found %d duplicate timestamps, resolving...\n', length(ts) - length(uniqueTs));
+        
+        % Create a new table with unique timestamps
+        newT = T(ia,:);
+        
+        % For duplicates, average the values using vectorized operations
+        if height(T) > 1 && width(T) > 1
+            dataVars = setdiff(T.Properties.VariableNames, {'Timestamp'});
+            
+            % Process each data variable
+            for i = 1:length(dataVars)
+                varName = dataVars{i};
+                if isnumeric(T.(varName))
+                    % Use accumarray for efficient grouping and averaging
+                    % This is much faster than looping through each timestamp
+                    newT.(varName) = accumarray(ic, T.(varName), [length(uniqueTs), 1], @(x) mean(x, 'omitnan'));
+                end
+            end
+        end
+        
+        % Replace original table with deduplicated one
+        T = newT;
+        ts = uniqueTs;
+        fprintf(' → Resolved duplicates by averaging values (optimized)\n');
+    end
+    
+    % Sort and reassemble table
+    [ts, I] = sort(ts);
+    T = T(I,:);
+    T.Timestamp = ts;
+    
+    % Determine sampling interval
+    diffs = diff(ts);
+    resolution = minutes(mode(diffs));
+    
+    % Handle irregular timestamps by aligning to regular intervals - Optimized for large datasets
+    if std(minutes(diffs)) > 0.1  % If standard deviation is significant
+        fprintf(' → Detected irregular time intervals, aligning to %d-minute grid...\n', resolution);
+        
+        % Determine the start and end times
+        startTime = ts(1);
+        endTime = ts(end);
+        
+        % Create a regular time grid - limit size for very large datasets
+        maxPoints = 1000000; % Prevent excessive memory usage
+        expectedPoints = ceil(days(endTime - startTime) * 24 * 60 / resolution);
+        
+        if expectedPoints > maxPoints
+            fprintf(' → Warning: Very large time range detected. Processing in chunks to optimize memory usage.\n');
+            chunkSize = maxPoints;
+            currentStart = startTime;
+            
+            % Initialize result table
+            dataVars = setdiff(T.Properties.VariableNames, {'Timestamp'});
+            regularT = table();
+            
+            % Process in chunks
+            while currentStart < endTime
+                currentEnd = min(currentStart + minutes(resolution * chunkSize), endTime);
+                currentGrid = currentStart:minutes(resolution):currentEnd;
+                
+                % Create chunk table
+                chunkT = table(currentGrid', 'VariableNames', {'Timestamp'});
+                
+                % Interpolate each variable
+                for i = 1:length(dataVars)
+                    varName = dataVars{i};
+                    if isnumeric(T.(varName))
+                        % Use linear interpolation with optimized method selection
+                        if length(ts) > 10000
+                            % For very large datasets, use 'nearest' which is faster
+                            chunkT.(varName) = interp1(datenum(ts), T.(varName), datenum(currentGrid'), 'nearest');
+                        else
+                            % For smaller datasets, use more accurate 'linear'
+                            chunkT.(varName) = interp1(datenum(ts), T.(varName), datenum(currentGrid'), 'linear');
+                        end
+                    end
+                end
+                
+                % Append to result
+                if isempty(regularT)
+                    regularT = chunkT;
+                else
+                    regularT = [regularT; chunkT];
+                end
+                
+                % Move to next chunk
+                currentStart = currentEnd + minutes(resolution);
+            end
+        else
+            % Standard processing for reasonably sized datasets
+            regularTs = startTime:minutes(resolution):endTime;
+            
+            % Interpolate values to regular grid
+            dataVars = setdiff(T.Properties.VariableNames, {'Timestamp'});
+            regularT = table(regularTs', 'VariableNames', {'Timestamp'});
+            
+            for i = 1:length(dataVars)
+                varName = dataVars{i};
+                if isnumeric(T.(varName))
+                    % Use linear interpolation for numeric variables
+                    regularT.(varName) = interp1(datenum(ts), T.(varName), datenum(regularTs'), 'linear');
+                end
+            end
+        end
+        
+        % Replace with regularized data
+        T = regularT;
+        ts = regularT.Timestamp;
+        fprintf(' → Aligned data to regular %d-minute intervals (optimized)\n', resolution);
+    end
+    fprintf(' → Detected sampling interval: %d minutes\n', resolution);
+    
+    % Return processed data and resolution
+    data = T;
+end
+
+% Parse nodal price data
+[nodalData, nodalResolution] = parseVariableResolutionData(histNodalFile);
+fprintf(' → Loaded %d rows of historical nodal price data\n', height(nodalData));
+
+%% 1.2 - Load and parse historical hub price data
+fprintf('Loading historical hub price data from: %s\n', histHubFile);
+assert(isfile(histHubFile), 'Historical hub price file not found: %s', histHubFile);
+
+% Parse hub price data
+[hubData, hubResolution] = parseVariableResolutionData(histHubFile);
+fprintf(' → Loaded %d rows of historical hub price data\n', height(hubData));
+
+%% 1.3 - Synchronize nodal and hub data
+fprintf('Synchronizing nodal and hub price data...\n');
+
+% Function: synchronizeNodalHubData
+% Aligns timestamps between nodal and hub data
+function [syncedNodalData, syncedHubData] = synchronizeNodalHubData(nodalData, hubData)
+    % Find overlapping time range
+    nodalTs = nodalData.Timestamp;
+    hubTs = hubData.Timestamp;
+    
+    startTime = max(min(nodalTs), min(hubTs));
+    endTime = min(max(nodalTs), max(hubTs));
+    
+    % Filter to overlapping range
+    nodalInRange = nodalData(nodalTs >= startTime & nodalTs <= endTime, :);
+    hubInRange = hubData(hubTs >= startTime & hubTs <= endTime, :);
+    
+    % Determine which dataset has finer resolution
+    nodalDiff = median(diff(nodalTs));
+    hubDiff = median(diff(hubTs));
+    
+    % Ensure hub timestamps are unique before interpolation
+    [uniqueHubTs, ia, ~] = unique(hubInRange.Timestamp);
+    if length(uniqueHubTs) < length(hubInRange.Timestamp)
+        fprintf(' → Found duplicate timestamps in hub data, resolving by averaging...\n');
+        hubPrices = hubInRange.Price;
+        uniqueHubPrices = zeros(size(uniqueHubTs));
+        
+        % Average prices for duplicate timestamps
+        for i = 1:length(uniqueHubTs)
+            idx = hubInRange.Timestamp == uniqueHubTs(i);
+            uniqueHubPrices(i) = mean(hubPrices(idx), 'omitnan');
+        end
+        
+        % Create new hub data with unique timestamps
+        hubInRange = table(uniqueHubTs, uniqueHubPrices, 'VariableNames', {'Timestamp', 'Price'});
+        hubTs = uniqueHubTs;
+    end
+    
+    if nodalDiff <= hubDiff
+        % Nodal data has finer or equal resolution
+        commonTs = nodalInRange.Timestamp;
+        
+        % Interpolate hub data to nodal timestamps
+        hubPrices = hubInRange.Price;
+        hubTimes = hubInRange.Timestamp;
+        
+        % Use try-catch to handle potential interpolation issues
+        try
+            interpHubPrices = interp1(datenum(hubTimes), hubPrices, datenum(commonTs), 'linear');
+        catch e
+            fprintf(' → Warning: Interpolation failed, using nearest neighbor method instead\n');
+            interpHubPrices = interp1(datenum(hubTimes), hubPrices, datenum(commonTs), 'nearest');
+        end
+        
+        % Create synchronized tables
+        syncedNodal = nodalInRange;
+        syncedHub = table(commonTs, interpHubPrices, 'VariableNames', {'Timestamp', 'Price'});
+    else
+        % Hub data has finer resolution
+        commonTs = hubInRange.Timestamp;
+        
+        % Interpolate nodal data to hub timestamps
+        % This is more complex as we have multiple nodes
+        nodeNames = setdiff(nodalInRange.Properties.VariableNames, {'Timestamp'});
+        syncedNodal = table(commonTs, 'VariableNames', {'Timestamp'});
+        
+        for i = 1:length(nodeNames)
+            nodeName = nodeNames{i};
+            nodePrices = nodalInRange.(nodeName);
+            nodeTimes = nodalInRange.Timestamp;
+            
+            % Use try-catch to handle potential interpolation issues
+            try
+                interpNodePrices = interp1(datenum(nodeTimes), nodePrices, datenum(commonTs), 'linear');
+            catch e
+                fprintf(' → Warning: Interpolation failed for node %s, using nearest neighbor method instead\n', nodeName);
+                interpNodePrices = interp1(datenum(nodeTimes), nodePrices, datenum(commonTs), 'nearest');
+            end
+            
+            syncedNodal.(nodeName) = interpNodePrices;
+        end
+        
+        syncedHub = hubInRange;
+    end
+    
+    fprintf(' → Synchronized data with %d common timestamps\n', height(syncedNodal));
+    
+    % Assign local variables to output arguments
+    syncedNodalData = syncedNodal;
+    syncedHubData = syncedHub;
+end
+
+% Synchronize the data
+[syncedNodalData, syncedHubData] = synchronizeNodalHubData(nodalData, hubData);
+
+%% 1.4 - Filter nodal price extremes
+fprintf('Filtering nodal price extremes...\n');
+
+% Function: filterNodalExtremes
+% Applies specialized filtering for nodal price anomalies
+function filteredData = filterNodalExtremes(nodalData)
+    % Get node names (all columns except Timestamp)
+    nodeNames = setdiff(nodalData.Properties.VariableNames, {'Timestamp'});
+    filteredData = nodalData;
+    
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePrices = nodalData.(nodeName);
+        
+        % Calculate statistics for this node
+        validPrices = nodePrices(~isnan(nodePrices) & ~isinf(nodePrices));
+        meanPrice = mean(validPrices);
+        stdPrice = std(validPrices);
+        
+        % Define extreme thresholds (more permissive for nodal prices)
+        % Nodal prices can have legitimate extreme values due to congestion
+        lowerThreshold = meanPrice - 10 * stdPrice;
+        upperThreshold = meanPrice + 10 * stdPrice;
+        
+        % Identify extreme outliers (beyond physical plausibility)
+        extremeOutliers = nodePrices < lowerThreshold | nodePrices > upperThreshold;
+        
+        % For extreme outliers, replace with nearest non-outlier value
+        if any(extremeOutliers)
+            outlierIndices = find(extremeOutliers);
+            for j = 1:length(outlierIndices)
+                idx = outlierIndices(j);
+                
+                % Find nearest non-outlier value
+                nonOutlierIndices = find(~extremeOutliers);
+                [~, nearestIdx] = min(abs(nonOutlierIndices - idx));
+                nearestNonOutlier = nodePrices(nonOutlierIndices(nearestIdx));
+                
+                % Replace outlier
+                filteredData.(nodeName)(idx) = nearestNonOutlier;
+            end
+            
+            fprintf(' → Filtered %d extreme values for node %s\n', ...
+                sum(extremeOutliers), nodeName);
+        else
+            fprintf(' → No extreme values found for node %s\n', nodeName);
+        end
+    end
+end
+
+% Filter extreme values
+filteredNodalData = filterNodalExtremes(syncedNodalData);
+
+%% 1.5 - Create training and validation sets
+fprintf('Creating training and validation sets...\n');
+
+% Function: createTrainingValidationSets
+% Splits data for model training and validation
+function [training, validation] = createTrainingValidationSets(data, validationFraction)
+    % Determine split point
+    nRows = height(data);
+    splitIdx = round(nRows * (1 - validationFraction));
+    
+    % Split data
+    training = data(1:splitIdx, :);
+    validation = data(splitIdx+1:end, :);
+    
+    fprintf(' → Training set: %d rows, Validation set: %d rows\n', ...
+        height(training), height(validation));
+end
+
+% Create training and validation sets
+[trainingData, validationData] = createTrainingValidationSets(filteredNodalData, 0.2);
+
+%% ==================== 2. NODAL PATTERN EXTRACTION MODULE ====================
+fprintf('\nStarting nodal pattern extraction module...\n');
+
+%% 2.1 - Calculate basis differentials
+fprintf('Calculating basis differentials...\n');
+
+% Function: calculateBasisDifferentials
+% Computes and analyzes node-to-hub spreads
+function basisDiffs = calculateBasisDifferentials(nodalData, hubData)
+    % Get node names
+    nodeNames = setdiff(nodalData.Properties.VariableNames, {'Timestamp'});
+    
+    % Initialize basis differential table
+    basisDiffs = table(nodalData.Timestamp, 'VariableNames', {'Timestamp'});
+    
+    % Align hub data with nodal data timestamps
+    fprintf(' → Aligning hub data to nodal timestamps for basis calculation...\n');
+    
+    % Create a mapping from hub timestamps to hub prices for efficient lookup
+    hubTimes = hubData.Timestamp;
+    hubPrices = hubData.Price;
+    
+    % Find common timestamps between nodal and hub data
+    [~, nodalIdx, hubIdx] = intersect(nodalData.Timestamp, hubTimes);
+    
+    if length(nodalIdx) < height(nodalData)
+        fprintf(' → Warning: Only %d of %d nodal timestamps found in hub data\n', ...
+            length(nodalIdx), height(nodalData));
+        
+        % Use interpolation to get hub prices at all nodal timestamps
+        alignedHubPrices = interp1(datenum(hubTimes), hubPrices, datenum(nodalData.Timestamp), 'linear', 'extrap');
+    else
+        % Direct mapping is possible
+        alignedHubPrices = hubPrices(hubIdx);
+    end
+    
+    % Calculate basis differential for each node
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePrices = nodalData.(nodeName);
+        
+        % Calculate differential using aligned hub prices
+        differential = nodePrices - alignedHubPrices;
+        
+        % Add to table
+        basisDiffs.(nodeName) = differential;
+        
+        % Calculate statistics
+        meanDiff = mean(differential, 'omitnan');
+        stdDiff = std(differential, 'omitnan');
+        maxDiff = max(differential, [], 'omitnan');
+        minDiff = min(differential, [], 'omitnan');
+        
+        fprintf(' → Node %s basis differential: mean=%.2f, std=%.2f, range=[%.2f, %.2f]\n', ...
+            nodeName, meanDiff, stdDiff, minDiff, maxDiff);
+    end
+end
+
+% Calculate basis differentials
+basisDifferentials = calculateBasisDifferentials(trainingData, syncedHubData);
+
+%% 2.2 - Identify node-specific volatility patterns
+fprintf('Identifying node-specific volatility patterns...\n');
+
+% Function: identifyNodeVolatilityPatterns
+% Extracts node-specific volatility characteristics
+function volatilityPatterns = identifyNodeVolatilityPatterns(nodalData, resolution)
+    % Get node names
+    nodeNames = setdiff(nodalData.Properties.VariableNames, {'Timestamp'});
+    
+    % Determine number of intervals per day
+    intervalsPerDay = 24 * 60 / resolution;
+    
+    % Initialize volatility patterns structure
+    volatilityPatterns = struct();
+    
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePrices = nodalData.(nodeName);
+        
+        % Extract timestamps
+        timestamps = nodalData.Timestamp;
+        
+        % Create hour-of-day index
+        hourOfDay = hour(timestamps);
+        
+        % Calculate hourly volatility patterns
+        hourlyVolatility = zeros(24, 1);
+        for h = 0:23
+            hourIndices = (hourOfDay == h);
+            if sum(hourIndices) > 1
+                hourlyVolatility(h+1) = std(nodePrices(hourIndices), 'omitnan');
+            end
+        end
+        
+        % Normalize hourly volatility
+        normalizedHourlyVolatility = hourlyVolatility / mean(hourlyVolatility, 'omitnan');
+        
+        % Store in structure
+        volatilityPatterns.(nodeName).hourlyVolatility = hourlyVolatility;
+        volatilityPatterns.(nodeName).normalizedHourlyVolatility = normalizedHourlyVolatility;
+        
+        % Calculate day-of-week effect
+        dayOfWeek = weekday(timestamps);
+        dowVolatility = zeros(7, 1);
+        for d = 1:7
+            dowIndices = (dayOfWeek == d);
+            if sum(dowIndices) > 1
+                dowVolatility(d) = std(nodePrices(dowIndices), 'omitnan');
+            end
+        end
+        
+        % Normalize day-of-week volatility
+        normalizedDowVolatility = dowVolatility / mean(dowVolatility, 'omitnan');
+        
+        % Store in structure
+        volatilityPatterns.(nodeName).dowVolatility = dowVolatility;
+        volatilityPatterns.(nodeName).normalizedDowVolatility = normalizedDowVolatility;
+        
+        fprintf(' → Node %s volatility patterns extracted\n', nodeName);
+    end
+end
+
+% Identify volatility patterns
+volatilityPatterns = identifyNodeVolatilityPatterns(trainingData, nodalResolution);
+
+%% 2.3 - Detect congestion patterns
+fprintf('Detecting congestion patterns...\n');
+
+% Function: detectCongestionPatterns
+% Identifies and classifies congestion events
+function congestionPatterns = detectCongestionPatterns(basisDiffs)
+    % Get node names
+    nodeNames = setdiff(basisDiffs.Properties.VariableNames, {'Timestamp'});
+    
+    % Initialize congestion patterns structure
+    congestionPatterns = struct();
+    
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodeDiffs = basisDiffs.(nodeName);
+        
+        % Calculate statistics for congestion detection
+        meanDiff = mean(nodeDiffs, 'omitnan');
+        stdDiff = std(nodeDiffs, 'omitnan');
+        
+        % Define congestion thresholds
+        positiveCongestionThreshold = meanDiff + 2 * stdDiff;
+        negativeCongestionThreshold = meanDiff - 2 * stdDiff;
+        
+        % Identify congestion events
+        positiveCongestion = nodeDiffs > positiveCongestionThreshold;
+        negativeCongestion = nodeDiffs < negativeCongestionThreshold;
+        
+        % Calculate congestion frequency
+        positiveCongestionFreq = sum(positiveCongestion) / length(nodeDiffs);
+        negativeCongestionFreq = sum(negativeCongestion) / length(nodeDiffs);
+        
+        % Store in structure
+        congestionPatterns.(nodeName).positiveCongestionThreshold = positiveCongestionThreshold;
+        congestionPatterns.(nodeName).negativeCongestionThreshold = negativeCongestionThreshold;
+        congestionPatterns.(nodeName).positiveCongestionFreq = positiveCongestionFreq;
+        congestionPatterns.(nodeName).negativeCongestionFreq = negativeCongestionFreq;
+        
+        % Identify congestion events (consecutive periods)
+        congestionEvents = struct('positive', [], 'negative', []);
+        
+        % Find positive congestion events
+        inEvent = false;
+        eventStart = 0;
+        for j = 1:length(nodeDiffs)
+            if positiveCongestion(j) && ~inEvent
+                % Start of new event
+                inEvent = true;
+                eventStart = j;
+            elseif ~positiveCongestion(j) && inEvent
+                % End of event
+                inEvent = false;
+                eventEnd = j - 1;
+                eventDuration = eventEnd - eventStart + 1;
+                
+                % Only record events of significant duration
+                if eventDuration >= 3
+                    congestionEvents.positive(end+1, :) = [eventStart, eventEnd, eventDuration];
+                end
+            end
+        end
+        
+        % Find negative congestion events
+        inEvent = false;
+        eventStart = 0;
+        for j = 1:length(nodeDiffs)
+            if negativeCongestion(j) && ~inEvent
+                % Start of new event
+                inEvent = true;
+                eventStart = j;
+            elseif ~negativeCongestion(j) && inEvent
+                % End of event
+                inEvent = false;
+                eventEnd = j - 1;
+                eventDuration = eventEnd - eventStart + 1;
+                
+                % Only record events of significant duration
+                if eventDuration >= 3
+                    congestionEvents.negative(end+1, :) = [eventStart, eventEnd, eventDuration];
+                end
+            end
+        end
+        
+        % Store events in structure
+        congestionPatterns.(nodeName).events = congestionEvents;
+        
+        fprintf(' → Node %s: Positive congestion freq=%.2f%%, Negative congestion freq=%.2f%%\n', ...
+            nodeName, positiveCongestionFreq*100, negativeCongestionFreq*100);
+    end
+end
+
+% Detect congestion patterns
+congestionPatterns = detectCongestionPatterns(basisDifferentials);
+
+%% 2.4 - Build structural models of hub-node relationships
+fprintf('Building structural models of hub-node relationships...\n');
+
+% Function: buildStructuralModels
+% Creates models of hub-node relationships
+function structuralModels = buildStructuralModels(nodalData, hubData, basisDiffs)
+    % Get node names
+    nodeNames = setdiff(nodalData.Properties.VariableNames, {'Timestamp'});
+    
+    % Initialize structural models structure
+    structuralModels = struct();
+    
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePrices = nodalData.(nodeName);
+        hubPrices = hubData.Price;
+        nodeDiffs = basisDiffs.(nodeName);
+        
+        % Extract timestamps
+        timestamps = nodalData.Timestamp;
+        
+        % Create hour-of-day index
+        hourOfDay = hour(timestamps);
+        
+        % Fit linear model for each hour of day
+        hourlyModels = cell(24, 1);
+        hourlyRSquared = zeros(24, 1);
+        
+        for h = 0:23
+            hourIndices = (hourOfDay == h);
+            if sum(hourIndices) > 10  % Need sufficient data for regression
+                X = hubPrices(hourIndices);
+                Y = nodePrices(hourIndices);
+                
+                % Remove NaN values
+                validIndices = ~isnan(X) & ~isnan(Y);
+                X = X(validIndices);
+                Y = Y(validIndices);
+                
+                if length(X) > 10  % Still need sufficient data after NaN removal
+                    % Fit linear model: NodePrice = a + b*HubPrice
+                    mdl = fitlm(X, Y, 'linear');
+                    hourlyModels{h+1} = mdl;
+                    hourlyRSquared(h+1) = mdl.Rsquared.Ordinary;
+                end
+            end
+        end
+        
+        % Store in structure
+        structuralModels.(nodeName).hourlyModels = hourlyModels;
+        structuralModels.(nodeName).hourlyRSquared = hourlyRSquared;
+        
+        % Calculate average R-squared
+        validRSquared = hourlyRSquared(hourlyRSquared > 0);
+        avgRSquared = mean(validRSquared);
+        
+        fprintf(' → Node %s: Average R-squared=%.4f\n', nodeName, avgRSquared);
+        
+        % Fit regime-switching model
+        % Use k-means clustering to identify regimes
+        try
+            % Prepare data for clustering
+            X = [hubPrices, nodeDiffs];
+            
+            % Remove NaN values
+            validIndices = ~isnan(X(:,1)) & ~isnan(X(:,2));
+            X = X(validIndices, :);
+            
+            % Normalize data
+            X_norm = zscore(X);
+            
+            % Determine optimal number of clusters (2-4)
+            maxClusters = min(4, floor(size(X, 1) / 100));  % Ensure sufficient data per cluster
+            silhouettes = zeros(maxClusters-1, 1);
+            
+            for k = 2:maxClusters
+                [idx, ~] = kmeans(X_norm, k, 'Replicates', 5);
+                silh = silhouette(X_norm, idx);
+                silhouettes(k-1) = mean(silh);
+            end
+            
+            % Select optimal number of clusters
+            [~, bestK] = max(silhouettes);
+            bestK = bestK + 1;  % Adjust for 0-indexing
+            
+            % Cluster the data
+            [clusterIdx, clusterCenters] = kmeans(X_norm, bestK, 'Replicates', 10);
+            
+            % Fit linear model for each regime
+            regimeModels = cell(bestK, 1);
+            regimeRSquared = zeros(bestK, 1);
+            regimeCounts = zeros(bestK, 1);
+            
+            for r = 1:bestK
+                regimeIndices = (clusterIdx == r);
+                regimeCounts(r) = sum(regimeIndices);
+                
+                X_regime = X(regimeIndices, 1);  % Hub prices
+                Y_regime = X(regimeIndices, 1) + X(regimeIndices, 2);  % Node prices
+                
+                % Fit linear model: NodePrice = a + b*HubPrice
+                mdl = fitlm(X_regime, Y_regime, 'linear');
+                regimeModels{r} = mdl;
+                regimeRSquared(r) = mdl.Rsquared.Ordinary;
+            end
+            
+            % Store in structure
+            structuralModels.(nodeName).regimeModels = regimeModels;
+            structuralModels.(nodeName).regimeRSquared = regimeRSquared;
+            structuralModels.(nodeName).regimeCounts = regimeCounts;
+            structuralModels.(nodeName).regimeCenters = clusterCenters;
+            structuralModels.(nodeName).numRegimes = bestK;
+            
+            fprintf(' → Node %s: Identified %d regimes with avg R-squared=%.4f\n', ...
+                nodeName, bestK, mean(regimeRSquared));
+        catch
+            fprintf(' → Node %s: Failed to fit regime-switching model, using hourly models only\n', ...
+                nodeName);
+            structuralModels.(nodeName).numRegimes = 0;
+        end
+    end
+end
+
+% Build structural models
+structuralModels = buildStructuralModels(trainingData, syncedHubData, basisDifferentials);
+
+%% ==================== 3. RESOLUTION MAPPING MODULE ====================
+fprintf('\nStarting resolution mapping module...\n');
+
+%% 3.1 - Implement bidirectional conversion between hourly and subhourly resolutions
+fprintf('Implementing bidirectional resolution conversion...\n');
+
+% Function: downscaleHourlyToSubhourly
+% Generates subhourly patterns from hourly data
+function subhourlyData = downscaleHourlyToSubhourly(hourlyData, subhourlyResolution, historicalPatterns)
+    % Get node names
+    nodeNames = setdiff(hourlyData.Properties.VariableNames, {'Timestamp'});
+    
+    % Calculate number of subhourly intervals per hour
+    intervalsPerHour = 60 / subhourlyResolution;
+    
+    % Initialize subhourly data
+    nHours = height(hourlyData);
+    nSubhourly = nHours * intervalsPerHour;
+    
+    % Create subhourly timestamps
+    hourlyTimestamps = hourlyData.Timestamp;
+    subhourlyTimestamps = NaT(nSubhourly, 1); % Using NaT instead of zeros for datetime initialization
+    
+    for i = 1:nHours
+        baseTime = hourlyTimestamps(i);
+        for j = 1:intervalsPerHour
+            idx = (i-1) * intervalsPerHour + j;
+            minuteOffset = (j-1) * subhourlyResolution;
+            subhourlyTimestamps(idx) = baseTime + minutes(minuteOffset);
+        end
+    end
+    
+    % Initialize subhourly data table
+    subhourlyData = table(subhourlyTimestamps, 'VariableNames', {'Timestamp'});
+    
+    % Downscale each node's data
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        hourlyPrices = hourlyData.(nodeName);
+        
+        % Initialize subhourly prices
+        subhourlyPrices = zeros(nSubhourly, 1);
+        
+        % Apply historical patterns for downscaling
+        if isfield(historicalPatterns, nodeName) && ...
+           isfield(historicalPatterns.(nodeName), 'subhourlyPatterns')
+            % Use node-specific historical patterns
+            patterns = historicalPatterns.(nodeName).subhourlyPatterns;
+            
+            for i = 1:nHours
+                hourPrice = hourlyPrices(i);
+                hourOfDay = hour(hourlyTimestamps(i));
+                
+                % Get appropriate pattern for this hour
+                if hourOfDay + 1 <= size(patterns, 1)
+                    pattern = patterns(hourOfDay + 1, :);
+                else
+                    pattern = ones(1, intervalsPerHour) / intervalsPerHour;
+                end
+                
+                % Apply pattern while preserving hourly average
+                for j = 1:intervalsPerHour
+                    idx = (i-1) * intervalsPerHour + j;
+                    subhourlyPrices(idx) = hourPrice * pattern(j) * intervalsPerHour;
+                end
+            end
+        else
+            % Use simple interpolation if no patterns available
+            for i = 1:nHours
+                hourPrice = hourlyPrices(i);
+                
+                % Use flat profile (all intervals equal to hourly price)
+                for j = 1:intervalsPerHour
+                    idx = (i-1) * intervalsPerHour + j;
+                    subhourlyPrices(idx) = hourPrice;
+                end
+            end
+        end
+        
+        % Add to table
+        subhourlyData.(nodeName) = subhourlyPrices;
+    end
+    
+    fprintf(' → Downscaled %d hourly intervals to %d subhourly intervals\n', ...
+        nHours, nSubhourly);
+end
+
+% Function: upscaleSubhourlyToHourly
+% Aggregates subhourly data to hourly resolution
+function hourlyData = upscaleSubhourlyToHourly(subhourlyData, subhourlyResolution)
+    % Get node names
+    nodeNames = setdiff(subhourlyData.Properties.VariableNames, {'Timestamp'});
+    
+    % Calculate number of subhourly intervals per hour
+    intervalsPerHour = 60 / subhourlyResolution;
+    
+    % Extract timestamps
+    timestamps = subhourlyData.Timestamp;
+    
+    % Create hourly timestamp grid
+    hourlyTimestamps = datetime(year(timestamps), month(timestamps), day(timestamps), ...
+        hour(timestamps), 0, 0);
+    uniqueHourlyTimestamps = unique(hourlyTimestamps);
+    
+    % Initialize hourly data table
+    hourlyData = table(uniqueHourlyTimestamps, 'VariableNames', {'Timestamp'});
+    
+    % Upscale each node's data
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        subhourlyPrices = subhourlyData.(nodeName);
+        
+        % Initialize hourly prices
+        hourlyPrices = zeros(length(uniqueHourlyTimestamps), 1);
+        
+        % Aggregate to hourly
+        for j = 1:length(uniqueHourlyTimestamps)
+            hourTimestamp = uniqueHourlyTimestamps(j);
+            
+            % Find all subhourly intervals in this hour
+            hourIndices = (hourlyTimestamps == hourTimestamp);
+            
+            % Calculate hourly average
+            if sum(hourIndices) > 0
+                hourlyPrices(j) = mean(subhourlyPrices(hourIndices), 'omitnan');
+            else
+                hourlyPrices(j) = NaN;
+            end
+        end
+        
+        % Add to table
+        hourlyData.(nodeName) = hourlyPrices;
+    end
+    
+    fprintf(' → Upscaled %d subhourly intervals to %d hourly intervals\n', ...
+        height(subhourlyData), height(hourlyData));
+end
+
+% Extract historical subhourly patterns
+historicalPatterns = struct();
+
+% For each node, extract typical subhourly patterns by hour of day
+nodeNames = setdiff(trainingData.Properties.VariableNames, {'Timestamp'});
+for i = 1:length(nodeNames)
+    nodeName = nodeNames{i};
+    
+    % Extract timestamps and prices
+    timestamps = trainingData.Timestamp;
+    prices = trainingData.(nodeName);
+    
+    % Create hour-of-day index
+    hourOfDay = hour(timestamps);
+    
+    % Create minute-of-hour index
+    minuteOfHour = minute(timestamps);
+    
+    % Calculate intervals per hour
+    intervalsPerHour = 60 / nodalResolution;
+    
+    % Initialize patterns matrix (24 hours x intervals per hour)
+    patterns = zeros(24, intervalsPerHour);
+    
+    % For each hour of day, calculate typical pattern
+    for h = 0:23
+        % Find all data points in this hour
+        hourIndices = (hourOfDay == h);
+        hourPrices = prices(hourIndices);
+        hourMinutes = minuteOfHour(hourIndices);
+        
+        if sum(hourIndices) > 0
+            % Calculate average price for this hour
+            hourAvg = mean(hourPrices, 'omitnan');
+            
+            if hourAvg ~= 0
+                % For each interval within the hour, calculate relative value
+                for j = 1:intervalsPerHour
+                    intervalMinute = (j-1) * nodalResolution;
+                    intervalIndices = (hourMinutes == intervalMinute);
+                    
+                    if sum(intervalIndices) > 0
+                        intervalPrices = hourPrices(intervalIndices);
+                        intervalAvg = mean(intervalPrices, 'omitnan');
+                        
+                        % Store relative value (ratio to hour average)
+                        patterns(h+1, j) = intervalAvg / hourAvg;
+                    else
+                        % If no data for this interval, use 1.0 (equal to hour average)
+                        patterns(h+1, j) = 1.0;
+                    end
+                end
+                
+                % Normalize pattern to ensure it averages to 1.0
+                patterns(h+1, :) = patterns(h+1, :) / mean(patterns(h+1, :), 'omitnan');
+            else
+                % If hour average is zero, use flat pattern
+                patterns(h+1, :) = ones(1, intervalsPerHour);
+            end
+        else
+            % If no data for this hour, use flat pattern
+            patterns(h+1, :) = ones(1, intervalsPerHour);
+        end
+    end
+    
+    % Store patterns in structure
+    historicalPatterns.(nodeName).subhourlyPatterns = patterns;
+end
+
+% Test bidirectional conversion
+% First, upscale training data to hourly
+hourlyTrainingData = upscaleSubhourlyToHourly(trainingData, nodalResolution);
+
+% Then, downscale back to subhourly
+reconSubhourlyData = downscaleHourlyToSubhourly(hourlyTrainingData, nodalResolution, historicalPatterns);
+
+%% 3.2 - Formulate hourly constraints
+fprintf('Formulating hourly constraints...\n');
+
+% Function: formulateHourlyConstraints
+% Creates mathematical constraints for hourly targets
+function constraints = formulateHourlyConstraints(hourlyTargets, subhourlyResolution)
+    % Get node names
+    nodeNames = setdiff(hourlyTargets.Properties.VariableNames, {'Timestamp'});
+    
+    % Calculate number of subhourly intervals per hour
+    intervalsPerHour = 60 / subhourlyResolution;
+    
+    % Initialize constraints structure
+    constraints = struct();
+    constraints.hourlyTargets = hourlyTargets;
+    constraints.intervalsPerHour = intervalsPerHour;
+    constraints.nodeNames = nodeNames;
+    
+    % For each node, create constraint matrices
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        hourlyPrices = hourlyTargets.(nodeName);
+        
+        % Store in structure
+        constraints.(nodeName).hourlyPrices = hourlyPrices;
+    end
+    
+    fprintf(' → Formulated hourly constraints for %d nodes\n', length(nodeNames));
+end
+
+% Formulate constraints using hourly training data
+hourlyConstraints = formulateHourlyConstraints(hourlyTrainingData, nodalResolution);
+
+%% 3.3 - Implement microstructure preservation
+fprintf('Implementing microstructure preservation...\n');
+
+% Function: preserveMicrostructure
+% Maintains realistic subhourly patterns during mapping
+function enhancedSubhourly = preserveMicrostructure(subhourlyData, volatilityPatterns, congestionPatterns)
+    % Get node names
+    nodeNames = setdiff(subhourlyData.Properties.VariableNames, {'Timestamp'});
+    
+    % Initialize enhanced data
+    enhancedSubhourly = subhourlyData;
+    
+    % Extract timestamps
+    timestamps = subhourlyData.Timestamp;
+    
+    % Create hour-of-day index - using compatible method for all MATLAB versions
+    hourOfDay = mod(floor(datenum(timestamps) * 24), 24);
+    
+    % For each node, enhance microstructure
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        prices = subhourlyData.(nodeName);
+        
+        % Get volatility patterns for this node
+        if isfield(volatilityPatterns, nodeName)
+            nodeVolatility = volatilityPatterns.(nodeName);
+            
+            % Apply hourly volatility pattern
+            if isfield(nodeVolatility, 'normalizedHourlyVolatility')
+                hourlyVolPattern = nodeVolatility.normalizedHourlyVolatility;
+                
+                % Calculate hourly means
+                uniqueHours = unique(hourOfDay);
+                hourlyMeans = zeros(length(uniqueHours), 1);
+                
+                for h = 1:length(uniqueHours)
+                    hourIdx = (hourOfDay == uniqueHours(h));
+                    hourlyMeans(h) = mean(prices(hourIdx), 'omitnan');
+                end
+                
+                % Apply volatility scaling while preserving hourly means
+                enhancedPrices = prices;
+                
+                for h = 1:length(uniqueHours)
+                    hour = uniqueHours(h);
+                    hourIdx = (hourOfDay == hour);
+                    
+                    if sum(hourIdx) > 0 && hour+1 <= length(hourlyVolPattern)
+                        % Get volatility scale for this hour
+                        volScale = hourlyVolPattern(hour+1);
+                        
+                        % Get mean for this hour
+                        hourMean = hourlyMeans(h);
+                        
+                        % Apply volatility scaling
+                        hourPrices = prices(hourIdx);
+                        scaledPrices = hourMean + (hourPrices - hourMean) * volScale;
+                        
+                        % Store enhanced prices
+                        enhancedPrices(hourIdx) = scaledPrices;
+                    end
+                end
+                
+                % Update prices
+                prices = enhancedPrices;
+            end
+        end
+        
+        % Get congestion patterns for this node
+        if isfield(congestionPatterns, nodeName)
+            nodeCongestion = congestionPatterns.(nodeName);
+            
+            % Apply congestion events if available
+            if isfield(nodeCongestion, 'events')
+                events = nodeCongestion.events;
+                
+                % Apply positive congestion events
+                if ~isempty(events.positive)
+                    % For demonstration, we'll just add a small congestion premium
+                    % In a real implementation, this would be more sophisticated
+                    congestionPremium = std(prices, 'omitnan') * 0.5;
+                    
+                    % Add premium to random intervals to simulate congestion
+                    nIntervals = length(prices);
+                    nCongestionIntervals = round(nIntervals * 0.05);  % 5% of intervals
+                    congestionIndices = randperm(nIntervals, nCongestionIntervals);
+                    
+                    prices(congestionIndices) = prices(congestionIndices) + congestionPremium;
+                end
+                
+                % Apply negative congestion events
+                if ~isempty(events.negative)
+                    % For demonstration, we'll just add a small congestion discount
+                    congestionDiscount = std(prices, 'omitnan') * 0.5;
+                    
+                    % Add discount to random intervals to simulate negative congestion
+                    nIntervals = length(prices);
+                    nCongestionIntervals = round(nIntervals * 0.05);  % 5% of intervals
+                    congestionIndices = randperm(nIntervals, nCongestionIntervals);
+                    
+                    prices(congestionIndices) = prices(congestionIndices) - congestionDiscount;
+                end
+            end
+        end
+        
+        % Store enhanced prices
+        enhancedSubhourly.(nodeName) = prices;
+    end
+    
+    fprintf(' → Enhanced microstructure for %d nodes\n', length(nodeNames));
+end
+
+% Enhance microstructure
+enhancedSubhourlyData = preserveMicrostructure(reconSubhourlyData, volatilityPatterns, congestionPatterns);
+
+%% ==================== 4. NODAL JUMP-DIFFUSION SIMULATOR ====================
+fprintf('\nStarting nodal jump-diffusion simulator...\n');
+
+%% 4.1 - Calibrate node-specific jump parameters
+fprintf('Calibrating node-specific jump parameters...\n');
+
+% Function: calibrateNodeJumpParameters
+% Determines jump parameters for each node
+function jumpParams = calibrateNodeJumpParameters(nodalData, volatilityPatterns)
+    % Get node names
+    nodeNames = setdiff(nodalData.Properties.VariableNames, {'Timestamp'});
+    
+    % Initialize jump parameters structure
+    jumpParams = struct();
+    
+    % Extract timestamps
+    timestamps = nodalData.Timestamp;
+    
+    % Create hour-of-day index
+    hourOfDay = hour(timestamps);
+    
+    % For each node, calibrate jump parameters
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        prices = nodalData.(nodeName);
+        
+        % Calculate returns
+        returns = diff(prices) ./ prices(1:end-1);
+        returns(isinf(returns) | isnan(returns)) = 0;
+        
+        % Calculate volatility
+        volatility = std(returns, 'omitnan');
+        
+        % Define jump threshold (multiple of volatility)
+        jumpThreshold = 3 * volatility;
+        
+        % Identify jumps
+        positiveJumps = returns > jumpThreshold;
+        negativeJumps = returns < -jumpThreshold;
+        
+        % Calculate jump probabilities
+        posJumpProb = sum(positiveJumps) / length(returns);
+        negJumpProb = sum(negativeJumps) / length(returns);
+        
+        % Calculate jump sizes
+        posJumpSizes = returns(positiveJumps);
+        negJumpSizes = abs(returns(negativeJumps));
+        
+        % Calculate mean jump sizes
+        meanPosJumpSize = mean(posJumpSizes, 'omitnan');
+        meanNegJumpSize = mean(negJumpSizes, 'omitnan');
+        
+        if isnan(meanPosJumpSize) || isempty(meanPosJumpSize)
+            meanPosJumpSize = 0.1;  % Default if no positive jumps
+        end
+        
+        if isnan(meanNegJumpSize) || isempty(meanNegJumpSize)
+            meanNegJumpSize = 0.1;  % Default if no negative jumps
+        end
+        
+        % Store basic jump parameters
+        jumpParams.(nodeName).posJumpProb = posJumpProb;
+        jumpParams.(nodeName).negJumpProb = negJumpProb;
+        jumpParams.(nodeName).meanPosJumpSize = meanPosJumpSize;
+        jumpParams.(nodeName).meanNegJumpSize = meanNegJumpSize;
+        
+        % Calculate hourly jump probabilities
+        hourlyPosJumpProb = zeros(24, 1);
+        hourlyNegJumpProb = zeros(24, 1);
+        
+        for h = 0:23
+            hourIndices = (hourOfDay(1:end-1) == h);
+            if sum(hourIndices) > 0
+                hourlyPosJumpProb(h+1) = sum(positiveJumps & hourIndices) / sum(hourIndices);
+                hourlyNegJumpProb(h+1) = sum(negativeJumps & hourIndices) / sum(hourIndices);
+            end
+        end
+        
+        % Store hourly jump probabilities
+        jumpParams.(nodeName).hourlyPosJumpProb = hourlyPosJumpProb;
+        jumpParams.(nodeName).hourlyNegJumpProb = hourlyNegJumpProb;
+        
+        fprintf(' → Node %s: Pos jump prob=%.4f, Neg jump prob=%.4f\n', ...
+            nodeName, posJumpProb, negJumpProb);
+    end
+end
+
+% Calibrate jump parameters
+jumpParameters = calibrateNodeJumpParameters(trainingData, volatilityPatterns);
+
+%% 4.2 - Implement asymmetric jump modeling
+fprintf('Implementing asymmetric jump modeling...\n');
+
+% Function: simulateAsymmetricJumps
+% Models positive and negative jumps separately
+function jumpPaths = simulateAsymmetricJumps(baselinePaths, jumpParams, timestamps)
+    % Get node names
+    nodeNames = fieldnames(jumpParams);
+    
+    % Initialize jump paths
+    jumpPaths = baselinePaths;
+    
+    % Create hour-of-day index
+    hourOfDay = hour(timestamps);
+    
+    % For each node, simulate jumps
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePrices = baselinePaths.(nodeName);
+        nodeJumpParams = jumpParams.(nodeName);
+        
+        % Extract jump parameters
+        posJumpProb = nodeJumpParams.posJumpProb;
+        negJumpProb = nodeJumpParams.negJumpProb;
+        meanPosJumpSize = nodeJumpParams.meanPosJumpSize;
+        meanNegJumpSize = nodeJumpParams.meanNegJumpSize;
+        
+        % Use hourly jump probabilities if available
+        if isfield(nodeJumpParams, 'hourlyPosJumpProb')
+            hourlyPosJumpProb = nodeJumpParams.hourlyPosJumpProb;
+            hourlyNegJumpProb = nodeJumpParams.hourlyNegJumpProb;
+            
+            % Initialize jump indicators as logical arrays
+            posJumpIndicator = false(size(nodePrices));
+            negJumpIndicator = false(size(nodePrices));
+            
+            % Simulate jumps for each hour
+            for h = 0:23
+                hourIndices = (hourOfDay == h);
+                
+                if sum(hourIndices) > 0 && h+1 <= length(hourlyPosJumpProb)
+                    % Get jump probabilities for this hour
+                    hourPosProbability = hourlyPosJumpProb(h+1);
+                    hourNegProbability = hourlyNegJumpProb(h+1);
+                    
+                    % Generate random numbers for jump occurrence
+                    posRand = rand(sum(hourIndices), 1);
+                    negRand = rand(sum(hourIndices), 1);
+                    
+                    % Determine jump occurrences
+                    posJumps = posRand < hourPosProbability;
+                    negJumps = negRand < hourNegProbability;
+                    
+                    % Store jump indicators
+                    posJumpIndicator(hourIndices) = posJumps;
+                    negJumpIndicator(hourIndices) = negJumps;
+                end
+            end
+        else
+            % Use constant jump probabilities
+            posRand = rand(size(nodePrices));
+            negRand = rand(size(nodePrices));
+            
+            posJumpIndicator = posRand < posJumpProb;
+            negJumpIndicator = negRand < negJumpProb;
+        end
+        
+        % Generate jump sizes
+        posJumpSizes = exprnd(meanPosJumpSize, size(nodePrices));
+        negJumpSizes = exprnd(meanNegJumpSize, size(nodePrices));
+        
+        % Apply jumps to prices
+        jumpedPrices = nodePrices;
+        
+        % Apply positive jumps
+        jumpedPrices(posJumpIndicator) = jumpedPrices(posJumpIndicator) .* (1 + posJumpSizes(posJumpIndicator));
+        
+        % Apply negative jumps
+        jumpedPrices(negJumpIndicator) = jumpedPrices(negJumpIndicator) .* (1 - negJumpSizes(negJumpIndicator));
+        
+        % Store jumped prices
+        jumpPaths.(nodeName) = jumpedPrices;
+    end
+    
+    fprintf(' → Simulated asymmetric jumps for %d nodes\n', length(nodeNames));
+end
+
+% Simulate jumps on enhanced subhourly data
+jumpedSubhourlyData = simulateAsymmetricJumps(enhancedSubhourlyData, jumpParameters, enhancedSubhourlyData.Timestamp);
+
+%% 4.3 - Incorporate transmission constraint effects
+fprintf('Incorporating transmission constraint effects...\n');
+
+% Function: incorporateTransmissionConstraints
+% Models effects of transmission limitations
+function constrainedPaths = incorporateTransmissionConstraints(jumpPaths, congestionPatterns, structuralModels)
+    % Get node names
+    nodeNames = setdiff(jumpPaths.Properties.VariableNames, {'Timestamp'});
+    
+    % Initialize constrained paths
+    constrainedPaths = jumpPaths;
+    
+    % Extract timestamps
+    timestamps = jumpPaths.Timestamp;
+    
+    % Create hour-of-day index
+    hourOfDay = hour(timestamps);
+    
+    % For each node, apply transmission constraints
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePrices = jumpPaths.(nodeName);
+        
+        % Check if we have congestion patterns for this node
+        if isfield(congestionPatterns, nodeName)
+            nodeCongestion = congestionPatterns.(nodeName);
+            
+            % Apply congestion thresholds if available
+            if isfield(nodeCongestion, 'positiveCongestionThreshold')
+                posThreshold = nodeCongestion.positiveCongestionThreshold;
+                negThreshold = nodeCongestion.negativeCongestionThreshold;
+                
+                % Calculate baseline statistics
+                meanPrice = mean(nodePrices, 'omitnan');
+                stdPrice = std(nodePrices, 'omitnan');
+                
+                % Simulate transmission constraints
+                % When congestion occurs, prices can move more extremely
+                constraintFactor = 1.5;  % Amplification factor during congestion
+                
+                % Identify potential congestion periods
+                highPrices = nodePrices > meanPrice + 2*stdPrice;
+                lowPrices = nodePrices < meanPrice - 2*stdPrice;
+                
+                % Apply constraint effects
+                constrainedPrices = nodePrices;
+                
+                % Amplify high prices during congestion
+                constrainedPrices(highPrices) = meanPrice + ...
+                    (constrainedPrices(highPrices) - meanPrice) * constraintFactor;
+                
+                % Amplify low prices during congestion
+                constrainedPrices(lowPrices) = meanPrice + ...
+                    (constrainedPrices(lowPrices) - meanPrice) * constraintFactor;
+                
+                % Store constrained prices
+                constrainedPaths.(nodeName) = constrainedPrices;
+            end
+        end
+    end
+    
+    fprintf(' → Incorporated transmission constraints for %d nodes\n', length(nodeNames));
+end
+
+% Apply transmission constraints
+constrainedSubhourlyData = incorporateTransmissionConstraints(jumpedSubhourlyData, congestionPatterns, structuralModels);
+
+%% 4.4 - Generate nodal price paths
+fprintf('Generating nodal price paths...\n');
+
+% Function: generateNodalPricePaths
+% Creates initial price paths for each node
+function [pricePaths, pathStats] = generateNodalPricePaths(nPaths, baseData, jumpParams, volatilityPatterns, structuralModels)
+    % Get node names
+    nodeNames = setdiff(baseData.Properties.VariableNames, {'Timestamp'});
+    
+    % Extract timestamps
+    timestamps = baseData.Timestamp;
+    nIntervals = length(timestamps);
+    
+    % Initialize price paths structure
+    pricePaths = struct();
+    pricePaths.Timestamp = timestamps;
+    
+    % Initialize path statistics
+    pathStats = struct();
+    
+    % For each node, generate paths
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        basePrices = baseData.(nodeName);
+        
+        % Initialize node paths
+        nodePaths = zeros(nIntervals, nPaths);
+        
+        % Get node-specific parameters
+        nodeJumpParams = jumpParams.(nodeName);
+        
+        % Get volatility patterns if available
+        if isfield(volatilityPatterns, nodeName)
+            nodeVolatility = volatilityPatterns.(nodeName);
+        else
+            nodeVolatility = struct();
+        end
+        
+        % Calculate base volatility
+        baseVolatility = std(diff(basePrices) ./ basePrices(1:end-1), 'omitnan');
+        if isnan(baseVolatility) || baseVolatility == 0
+            baseVolatility = 0.05;  % Default if volatility calculation fails
+        end
+        
+        % Generate paths
+        for p = 1:nPaths
+            % Start with base prices
+            pathPrices = basePrices;
+            
+            % Add random walk component
+            randomWalk = cumsum(randn(nIntervals, 1) * baseVolatility);
+            
+            % Scale random walk to maintain reasonable price levels
+            scaledRandomWalk = randomWalk * mean(basePrices, 'omitnan') * 0.1;
+            
+            % Add to base prices
+            pathPrices = pathPrices + scaledRandomWalk;
+            
+            % Apply jumps
+            % Use hourly jump probabilities if available
+            if isfield(nodeJumpParams, 'hourlyPosJumpProb')
+                hourlyPosJumpProb = nodeJumpParams.hourlyPosJumpProb;
+                hourlyNegJumpProb = nodeJumpParams.hourlyNegJumpProb;
+                
+                % Create hour-of-day index
+                hourOfDay = hour(timestamps);
+                
+                % Initialize jump indicators
+                posJumpIndicator = zeros(nIntervals, 1);
+                negJumpIndicator = zeros(nIntervals, 1);
+                
+                % Simulate jumps for each hour
+                for h = 0:23
+                    hourIndices = (hourOfDay == h);
+                    
+                    if sum(hourIndices) > 0 && h+1 <= length(hourlyPosJumpProb)
+                        % Get jump probabilities for this hour
+                        hourPosProbability = hourlyPosJumpProb(h+1);
+                        hourNegProbability = hourlyNegJumpProb(h+1);
+                        
+                        % Generate random numbers for jump occurrence
+                        posRand = rand(sum(hourIndices), 1);
+                        negRand = rand(sum(hourIndices), 1);
+                        
+                        % Determine jump occurrences
+                        posJumps = posRand < hourPosProbability;
+                        negJumps = negRand < hourNegProbability;
+                        
+                        % Store jump indicators
+                        posJumpIndicator(hourIndices) = posJumps;
+                        negJumpIndicator(hourIndices) = negJumps;
+                    end
+                end
+            else
+                % Use constant jump probabilities
+                posJumpProb = nodeJumpParams.posJumpProb;
+                negJumpProb = nodeJumpParams.negJumpProb;
+                
+                posRand = rand(nIntervals, 1);
+                negRand = rand(nIntervals, 1);
+                
+                posJumpIndicator = posRand < posJumpProb;
+                negJumpIndicator = negRand < negJumpProb;
+            end
+            
+            % Generate jump sizes
+            meanPosJumpSize = nodeJumpParams.meanPosJumpSize;
+            meanNegJumpSize = nodeJumpParams.meanNegJumpSize;
+            
+            posJumpSizes = exprnd(meanPosJumpSize, nIntervals, 1);
+            negJumpSizes = exprnd(meanNegJumpSize, nIntervals, 1);
+            
+            % Apply jumps to prices
+            % Apply positive jumps
+            pathPrices(posJumpIndicator) = pathPrices(posJumpIndicator) .* (1 + posJumpSizes(posJumpIndicator));
+            
+            % Apply negative jumps
+            pathPrices(negJumpIndicator) = pathPrices(negJumpIndicator) .* (1 - negJumpSizes(negJumpIndicator));
+            
+            % Store path
+            nodePaths(:, p) = pathPrices;
+        end
+        
+        % Store node paths
+        pricePaths.(nodeName) = nodePaths;
+        
+        % Calculate path statistics
+        pathMean = mean(nodePaths, 2);
+        pathStd = std(nodePaths, 0, 2);
+        
+        pathStats.(nodeName).mean = pathMean;
+        pathStats.(nodeName).std = pathStd;
+        
+        fprintf(' → Generated %d paths for node %s\n', nPaths, nodeName);
+    end
+end
+
+% Generate multiple price paths
+[nodalPricePaths, pathStats] = generateNodalPricePaths(nPaths, constrainedSubhourlyData, jumpParameters, volatilityPatterns, structuralModels);
+
+%% ==================== 5. HOURLY CONSTRAINT ENFORCEMENT ====================
+fprintf('\nStarting hourly constraint enforcement module...\n');
+
+%% 5.1 - Enforce hourly mean constraints
+fprintf('Enforcing hourly mean constraints...\n');
+
+% Function: enforceHourlyMeanConstraints
+% Adjusts paths to meet hourly targets
+function constrainedPaths = enforceHourlyMeanConstraints(pricePaths, hourlyTargets, subhourlyResolution)
+    % Get node names
+    nodeNames = fieldnames(pricePaths);
+    nodeNames = setdiff(nodeNames, {'Timestamp'});
+    
+    % Extract timestamps
+    timestamps = pricePaths.Timestamp;
+    
+    % Calculate number of subhourly intervals per hour
+    intervalsPerHour = 60 / subhourlyResolution;
+    
+    % Initialize constrained paths
+    constrainedPaths = pricePaths;
+    
+    % For each node, enforce hourly constraints
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePaths = pricePaths.(nodeName);
+        
+        % Get hourly targets for this node
+        nodeHourlyTargets = hourlyTargets.(nodeName);
+        
+        % Get dimensions
+        [nIntervals, nPaths] = size(nodePaths);
+        
+        % Create hourly timestamp grid
+        hourlyTimestamps = datetime(year(timestamps), month(timestamps), day(timestamps), ...
+            hour(timestamps), 0, 0);
+        uniqueHourlyTimestamps = unique(hourlyTimestamps);
+        
+        % Initialize constrained node paths
+        constrainedNodePaths = nodePaths;
+        
+        % For each path, enforce hourly constraints
+        for p = 1:nPaths
+            pathPrices = nodePaths(:, p);
+            
+            % For each hour, adjust prices to meet target
+            for h = 1:length(uniqueHourlyTimestamps)
+                hourTimestamp = uniqueHourlyTimestamps(h);
+                
+                % Find corresponding hourly target
+                targetIdx = find(hourlyTargets.Timestamp == hourTimestamp, 1);
+                
+                if ~isempty(targetIdx)
+                    hourlyTarget = nodeHourlyTargets(targetIdx);
+                    
+                    % Find all subhourly intervals in this hour
+                    hourIndices = (hourlyTimestamps == hourTimestamp);
+                    
+                    if sum(hourIndices) > 0
+                        % Calculate current hourly average
+                        currentAvg = mean(pathPrices(hourIndices), 'omitnan');
+                        
+                        % Calculate adjustment factor
+                        if currentAvg ~= 0
+                            adjustmentFactor = hourlyTarget / currentAvg;
+                        else
+                            adjustmentFactor = 1;
+                        end
+                        
+                        % Apply adjustment
+                        pathPrices(hourIndices) = pathPrices(hourIndices) * adjustmentFactor;
+                    end
+                end
+            end
+            
+            % Store constrained path
+            constrainedNodePaths(:, p) = pathPrices;
+        end
+        
+        % Store constrained node paths
+        constrainedPaths.(nodeName) = constrainedNodePaths;
+    end
+    
+    fprintf(' → Enforced hourly constraints for %d nodes\n', length(nodeNames));
+end
+
+% Enforce hourly constraints
+constrainedPricePaths = enforceHourlyMeanConstraints(nodalPricePaths, hourlyTrainingData, nodalResolution);
+
+%% 5.2 - Preserve volatility structure
+fprintf('Preserving volatility structure...\n');
+
+% Function: preserveVolatilityStructure
+% Maintains realistic volatility during adjustment
+function enhancedPaths = preserveVolatilityStructure(constrainedPaths, originalPaths, volatilityPatterns)
+    % Get node names
+    nodeNames = fieldnames(constrainedPaths);
+    nodeNames = setdiff(nodeNames, {'Timestamp'});
+    
+    % Initialize enhanced paths
+    enhancedPaths = constrainedPaths;
+    
+    % For each node, preserve volatility structure
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        constrainedNodePaths = constrainedPaths.(nodeName);
+        originalNodePaths = originalPaths.(nodeName);
+        
+        % Get dimensions
+        [nIntervals, nPaths] = size(constrainedNodePaths);
+        
+        % Initialize enhanced node paths
+        enhancedNodePaths = constrainedNodePaths;
+        
+        % For each path, preserve volatility
+        for p = 1:nPaths
+            constrainedPathPrices = constrainedNodePaths(:, p);
+            originalPathPrices = originalNodePaths(:, p);
+            
+            % Calculate returns
+            constrainedReturns = diff(constrainedPathPrices) ./ constrainedPathPrices(1:end-1);
+            originalReturns = diff(originalPathPrices) ./ originalPathPrices(1:end-1);
+            
+            % Replace NaN/Inf values
+            constrainedReturns(isnan(constrainedReturns) | isinf(constrainedReturns)) = 0;
+            originalReturns(isnan(originalReturns) | isinf(originalReturns)) = 0;
+            
+            % Calculate volatility ratio
+            constrainedVol = std(constrainedReturns, 'omitnan');
+            originalVol = std(originalReturns, 'omitnan');
+            
+            if constrainedVol > 0 && originalVol > 0
+                volRatio = originalVol / constrainedVol;
+            else
+                volRatio = 1;
+            end
+            
+            % Adjust returns to match original volatility
+            adjustedReturns = constrainedReturns * volRatio;
+            
+            % Reconstruct prices from adjusted returns
+            adjustedPrices = zeros(nIntervals, 1);
+            adjustedPrices(1) = constrainedPathPrices(1);
+            
+            for j = 2:nIntervals
+                adjustedPrices(j) = adjustedPrices(j-1) * (1 + adjustedReturns(j-1));
+            end
+            
+            % Rescale to maintain hourly averages
+            % Create hourly timestamp grid
+            timestamps = constrainedPaths.Timestamp;
+            hourlyTimestamps = datetime(year(timestamps), month(timestamps), day(timestamps), ...
+                hour(timestamps), 0, 0);
+            uniqueHourlyTimestamps = unique(hourlyTimestamps);
+            
+            for h = 1:length(uniqueHourlyTimestamps)
+                hourTimestamp = uniqueHourlyTimestamps(h);
+                
+                % Find all subhourly intervals in this hour
+                hourIndices = (hourlyTimestamps == hourTimestamp);
+                
+                if sum(hourIndices) > 0
+                    % Calculate current and target hourly average
+                    currentAvg = mean(adjustedPrices(hourIndices), 'omitnan');
+                    targetAvg = mean(constrainedPathPrices(hourIndices), 'omitnan');
+                    
+                    % Calculate adjustment factor
+                    if currentAvg ~= 0
+                        adjustmentFactor = targetAvg / currentAvg;
+                    else
+                        adjustmentFactor = 1;
+                    end
+                    
+                    % Apply adjustment
+                    adjustedPrices(hourIndices) = adjustedPrices(hourIndices) * adjustmentFactor;
+                end
+            end
+            
+            % Store enhanced path
+            enhancedNodePaths(:, p) = adjustedPrices;
+        end
+        
+        % Store enhanced node paths
+        enhancedPaths.(nodeName) = enhancedNodePaths;
+    end
+    
+    fprintf(' → Preserved volatility structure for %d nodes\n', length(nodeNames));
+end
+
+% Preserve volatility structure
+enhancedPricePaths = preserveVolatilityStructure(constrainedPricePaths, nodalPricePaths, volatilityPatterns);
+
+%% 5.3 - Apply adaptive scaling
+fprintf('Applying adaptive scaling...\n');
+
+% Function: adaptiveScaling
+% Applies context-sensitive scaling for different price regimes
+function adaptedPaths = adaptiveScaling(enhancedPaths, congestionPatterns)
+    % Get node names
+    nodeNames = fieldnames(enhancedPaths);
+    nodeNames = setdiff(nodeNames, {'Timestamp'});
+    
+    % Initialize adapted paths
+    adaptedPaths = enhancedPaths;
+    
+    % For each node, apply adaptive scaling
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        enhancedNodePaths = enhancedPaths.(nodeName);
+        
+        % Get dimensions
+        [nIntervals, nPaths] = size(enhancedNodePaths);
+        
+        % Initialize adapted node paths
+        adaptedNodePaths = enhancedNodePaths;
+        
+        % Check if we have congestion patterns for this node
+        if isfield(congestionPatterns, nodeName)
+            nodeCongestion = congestionPatterns.(nodeName);
+            
+            % Apply congestion thresholds if available
+            if isfield(nodeCongestion, 'positiveCongestionThreshold')
+                posThreshold = nodeCongestion.positiveCongestionThreshold;
+                negThreshold = nodeCongestion.negativeCongestionThreshold;
+                
+                % For each path, apply adaptive scaling
+                for p = 1:nPaths
+                    pathPrices = enhancedNodePaths(:, p);
+                    
+                    % Calculate mean and standard deviation
+                    meanPrice = mean(pathPrices, 'omitnan');
+                    stdPrice = std(pathPrices, 'omitnan');
+                    
+                    % Define price regimes
+                    highPrices = pathPrices > meanPrice + 2*stdPrice;
+                    lowPrices = pathPrices < meanPrice - 2*stdPrice;
+                    normalPrices = ~highPrices & ~lowPrices;
+                    
+                    % Apply different scaling to each regime
+                    adaptedPrices = pathPrices;
+                    
+                    % High price regime: allow more volatility
+                    if sum(highPrices) > 0
+                        highScalingFactor = 1.2;  % Increase volatility for high prices
+                        adaptedPrices(highPrices) = meanPrice + ...
+                            (adaptedPrices(highPrices) - meanPrice) * highScalingFactor;
+                    end
+                    
+                    % Low price regime: allow more volatility
+                    if sum(lowPrices) > 0
+                        lowScalingFactor = 1.2;  % Increase volatility for low prices
+                        adaptedPrices(lowPrices) = meanPrice + ...
+                            (adaptedPrices(lowPrices) - meanPrice) * lowScalingFactor;
+                    end
+                    
+                    % Normal price regime: maintain as is
+                    
+                    % Store adapted path
+                    adaptedNodePaths(:, p) = adaptedPrices;
+                end
+            end
+        end
+        
+        % Store adapted node paths
+        adaptedPaths.(nodeName) = adaptedNodePaths;
+    end
+    
+    fprintf(' → Applied adaptive scaling for %d nodes\n', length(nodeNames));
+end
+
+% Apply adaptive scaling
+adaptedPricePaths = adaptiveScaling(enhancedPricePaths, congestionPatterns);
+
+%% 5.4 - Validate constraint satisfaction
+fprintf('Validating constraint satisfaction...\n');
+
+% Function: validateConstraintSatisfaction
+% Verifies constraint compliance
+function [validationResults, constraintErrors] = validateConstraintSatisfaction(finalPaths, hourlyTargets, subhourlyResolution)
+    % Get node names
+    nodeNames = fieldnames(finalPaths);
+    nodeNames = setdiff(nodeNames, {'Timestamp'});
+    
+    % Extract timestamps
+    timestamps = finalPaths.Timestamp;
+    
+    % Calculate number of subhourly intervals per hour
+    intervalsPerHour = 60 / subhourlyResolution;
+    
+    % Initialize validation results
+    validationResults = struct();
+    constraintErrors = struct();
+    
+    % Create hourly timestamp grid
+    hourlyTimestamps = datetime(year(timestamps), month(timestamps), day(timestamps), ...
+        hour(timestamps), 0, 0);
+    uniqueHourlyTimestamps = unique(hourlyTimestamps);
+    
+    % For each node, validate constraint satisfaction
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePaths = finalPaths.(nodeName);
+        
+        % Get hourly targets for this node
+        nodeHourlyTargets = hourlyTargets.(nodeName);
+        
+        % Get dimensions
+        [nIntervals, nPaths] = size(nodePaths);
+        
+        % Initialize error metrics
+        meanAbsError = zeros(length(uniqueHourlyTimestamps), nPaths);
+        maxAbsError = zeros(length(uniqueHourlyTimestamps), nPaths);
+        relativeError = zeros(length(uniqueHourlyTimestamps), nPaths);
+        
+        % For each path, calculate errors
+        for p = 1:nPaths
+            pathPrices = nodePaths(:, p);
+            
+            % For each hour, calculate error
+            for h = 1:length(uniqueHourlyTimestamps)
+                hourTimestamp = uniqueHourlyTimestamps(h);
+                
+                % Find corresponding hourly target
+                targetIdx = find(hourlyTargets.Timestamp == hourTimestamp, 1);
+                
+                if ~isempty(targetIdx)
+                    hourlyTarget = nodeHourlyTargets(targetIdx);
+                    
+                    % Find all subhourly intervals in this hour
+                    hourIndices = (hourlyTimestamps == hourTimestamp);
+                    
+                    if sum(hourIndices) > 0
+                        % Calculate current hourly average
+                        currentAvg = mean(pathPrices(hourIndices), 'omitnan');
+                        
+                        % Calculate errors
+                        absError = abs(currentAvg - hourlyTarget);
+                        
+                        meanAbsError(h, p) = absError;
+                        maxAbsError(h, p) = absError;
+                        
+                        if hourlyTarget ~= 0
+                            relativeError(h, p) = absError / abs(hourlyTarget);
+                        else
+                            relativeError(h, p) = 0;
+                        end
+                    end
+                end
+            end
+        end
+        
+        % Calculate summary statistics
+        meanMeanAbsError = mean(meanAbsError(:), 'omitnan');
+        maxMaxAbsError = max(maxAbsError(:), [], 'omitnan');
+        meanRelativeError = mean(relativeError(:), 'omitnan');
+        maxRelativeError = max(relativeError(:), [], 'omitnan');
+        
+        % Store validation results
+        validationResults.(nodeName).meanAbsError = meanMeanAbsError;
+        validationResults.(nodeName).maxAbsError = maxMaxAbsError;
+        validationResults.(nodeName).meanRelativeError = meanRelativeError;
+        validationResults.(nodeName).maxRelativeError = maxRelativeError;
+        
+        % Store detailed constraint errors
+        constraintErrors.(nodeName).meanAbsError = meanAbsError;
+        constraintErrors.(nodeName).maxAbsError = maxAbsError;
+        constraintErrors.(nodeName).relativeError = relativeError;
+        
+        fprintf(' → Node %s: Mean rel error=%.6f%%, Max rel error=%.6f%%\n', ...
+            nodeName, meanRelativeError*100, maxRelativeError*100);
+    end
+end
+
+% Validate constraint satisfaction
+[validationResults, constraintErrors] = validateConstraintSatisfaction(adaptedPricePaths, hourlyTrainingData, nodalResolution);
+
+%% ==================== 6. OUTPUT GENERATION ====================
+fprintf('\nGenerating output...\n');
+
+% Function: prepareOutputData
+% Formats data for output
+function outputData = prepareOutputData(finalPaths)
+    % Get node names
+    nodeNames = fieldnames(finalPaths);
+    nodeNames = setdiff(nodeNames, {'Timestamp'});
+    
+    % Extract timestamps
+    timestamps = finalPaths.Timestamp;
+    nIntervals = length(timestamps);
+    
+    % Get number of paths
+    nPaths = size(finalPaths.(nodeNames{1}), 2);
+    
+    % Initialize output table
+    outputData = table(timestamps, 'VariableNames', {'Timestamp'});
+    
+    % For each node and path, add to output
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePaths = finalPaths.(nodeName);
+        
+        for p = 1:nPaths
+            pathName = sprintf('%s_Path%d', nodeName, p);
+            outputData.(pathName) = nodePaths(:, p);
+        end
+    end
+end
+
+% Prepare output data
+outputData = prepareOutputData(adaptedPricePaths);
+
+% Write to CSV
+fprintf('Writing output to %s...\n', outputFile);
+writetable(outputData, outputFile);
+
+fprintf('\nNodal+Subhourly Electricity Price Model completed successfully.\n');
