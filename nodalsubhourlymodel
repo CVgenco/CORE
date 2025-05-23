@@ -1492,11 +1492,36 @@ function [pricePaths, pathStats] = generateNodalPricePaths(nPaths, baseData, jum
             negJumpSizes = exprnd(meanNegJumpSize, nIntervals, 1);
             
             % Apply jumps to prices
+
+            % Ensure posJumpIndicator is logical for indexing
+            if isnumeric(posJumpIndicator)
+                posJumpIndicator = logical(posJumpIndicator);
+            end
+
             % Apply positive jumps
-            pathPrices(posJumpIndicator) = pathPrices(posJumpIndicator) .* (1 + posJumpSizes(posJumpIndicator));
+            if isnumeric(pathPrices) && ~isempty(posJumpIndicator) && any(posJumpIndicator)
+                pathPrices(posJumpIndicator) = pathPrices(posJumpIndicator) .* (1 + posJumpSizes(posJumpIndicator));
+            elseif ~isnumeric(pathPrices)
+                disp('Error: pathPrices (local) is not a numeric array before positive jump application!');
+                % disp(class(pathPrices)); % Optional: display class for debugging
+            else
+                % disp('Debug: No positive jumps to apply or posJumpIndicator is empty/all false.'); % Optional debug message
+            end
+
+            % Ensure negJumpIndicator is logical for indexing
+            if isnumeric(negJumpIndicator)
+                negJumpIndicator = logical(negJumpIndicator);
+            end
             
             % Apply negative jumps
-            pathPrices(negJumpIndicator) = pathPrices(negJumpIndicator) .* (1 - negJumpSizes(negJumpIndicator));
+            if isnumeric(pathPrices) && ~isempty(negJumpIndicator) && any(negJumpIndicator)
+                pathPrices(negJumpIndicator) = pathPrices(negJumpIndicator) .* (1 - negJumpSizes(negJumpIndicator));
+            elseif ~isnumeric(pathPrices)
+                disp('Error: pathPrices (local) is not a numeric array before negative jump application!');
+                % disp(class(pathPrices)); % Optional: display class for debugging
+            else
+                % disp('Debug: No negative jumps to apply or negJumpIndicator is empty/all false.'); % Optional debug message
+            end
             
             % Store path
             nodePaths(:, p) = pathPrices;
