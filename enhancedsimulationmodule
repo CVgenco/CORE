@@ -1,0 +1,898 @@
+%% Enhanced Simulation Module for Electricity Price Model
+% This module implements advanced simulation techniques for improved
+% autocorrelation and volatility modeling using multiple data sources.
+
+%% 1. Enhanced Autocorrelation Module
+
+function [enhancedPaths] = enhanceAutocorrelation(paths, historicalData, ancillaryData, generationData, forecastData)
+    % Enhances the autocorrelation structure of simulated paths using multiple data sources
+    %
+    % Inputs:
+    %   paths - Structure containing simulated price paths
+    %   historicalData - Structure containing historical price data
+    %   ancillaryData - Structure containing ancillary price data
+    %   generationData - Structure containing generation data
+    %   forecastData - Structure containing forecast data
+    %
+    % Outputs:
+    %   enhancedPaths - Structure containing paths with enhanced autocorrelation
+    
+    fprintf('Enhancing autocorrelation structure...\n');
+    
+    % Get node names
+    nodeNames = fieldnames(paths);
+    nodeNames = setdiff(nodeNames, {'Timestamp'});
+    
+    % Initialize enhanced paths
+    enhancedPaths = paths;
+    
+    % Extract timestamps
+    timestamps = paths.Timestamp;
+    
+    % For each node, enhance autocorrelation
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePaths = paths.(nodeName);
+        
+        % Get dimensions
+        [nIntervals, nPaths] = size(nodePaths);
+        
+        % Initialize enhanced node paths
+        enhancedNodePaths = nodePaths;
+        
+        % Extract historical autocorrelation patterns
+        if isfield(historicalData, nodeName)
+            historicalPrices = historicalData.(nodeName);
+            
+            % Calculate historical autocorrelation at multiple lags
+            maxLag = min(24, floor(length(historicalPrices)/10)); % Up to 24 lags, but not more than 1/10 of data length
+            historicalACF = zeros(maxLag, 1);
+            
+            % Calculate returns for autocorrelation
+            historicalReturns = diff(historicalPrices) ./ historicalPrices(1:end-1);
+            historicalReturns(isnan(historicalReturns) | isinf(historicalReturns)) = 0;
+            
+            for lag = 1:maxLag
+                if lag < length(historicalReturns)
+                    % Calculate autocorrelation at this lag
+                    historicalACF(lag) = corr(historicalReturns(1:end-lag), historicalReturns(lag+1:end), 'rows', 'complete');
+                end
+            end
+            
+            % Identify significant lags
+            significantLags = find(abs(historicalACF) > 2/sqrt(length(historicalReturns)));
+            
+            % If no significant lags, use lag-1
+            if isempty(significantLags)
+                significantLags = 1;
+            end
+            
+            % Extract hour-of-day and day-of-week
+            hourOfDay = hour(timestamps);
+            dayOfWeek = weekday(timestamps);
+            
+            % Create conditional ACF based on hour-of-day
+            conditionalACF = zeros(24, maxLag);
+            
+            for h = 0:23
+                hourIndices = (hourOfDay(1:end-1) == h);
+                if sum(hourIndices) > maxLag*10 % Need sufficient data
+                    hourReturns = historicalReturns(hourIndices);
+                    
+                    for lag = 1:maxLag
+                        if lag < length(hourReturns)
+                            conditionalACF(h+1, lag) = corr(hourReturns(1:end-lag), hourReturns(lag+1:end), 'rows', 'complete');
+                        end
+                    end
+                else
+                    % Use overall ACF if insufficient data
+                    conditionalACF(h+1, :) = historicalACF';
+                end
+            end
+            
+            % Incorporate ancillary price information if available
+            if exist('ancillaryData', 'var') && ~isempty(ancillaryData)
+                % Extract ancillary price regimes
+                ancillaryRegimes = identifyAncillaryRegimes(ancillaryData, timestamps);
+                
+                % Create regime-conditional ACF
+                regimeACF = struct();
+                regimeTypes = unique(ancillaryRegimes);
+                
+                for r = 1:length(regimeTypes)
+                    regime = regimeTypes(r);
+                    regimeIndices = (ancillaryRegimes(1:end-1) == regime);
+                    
+                    if sum(regimeIndices) > maxLag*10 % Need sufficient data
+                        regimeReturns = historicalReturns(regimeIndices);
+                        
+                        regimeACF.(sprintf('regime%d', regime)) = zeros(maxLag, 1);
+                        
+                        for lag = 1:maxLag
+                            if lag < length(regimeReturns)
+                                regimeACF.(sprintf('regime%d', regime))(lag) = ...
+                                    corr(regimeReturns(1:end-lag), regimeReturns(lag+1:end), 'rows', 'complete');
+                            end
+                        end
+                    end
+                end
+            end
+            
+            % Incorporate generation data if available
+            if exist('generationData', 'var') && ~isempty(generationData)
+                % Extract generation regimes (e.g., high/low/medium)
+                generationRegimes = identifyGenerationRegimes(generationData, timestamps);
+                
+                % Create generation-conditional ACF
+                genRegimeACF = struct();
+                genRegimeTypes = unique(generationRegimes);
+                
+                for r = 1:length(genRegimeTypes)
+                    regime = genRegimeTypes(r);
+                    regimeIndices = (generationRegimes(1:end-1) == regime);
+                    
+                    if sum(regimeIndices) > maxLag*10 % Need sufficient data
+                        regimeReturns = historicalReturns(regimeIndices);
+                        
+                        genRegimeACF.(sprintf('regime%d', regime)) = zeros(maxLag, 1);
+                        
+                        for lag = 1:maxLag
+                            if lag < length(regimeReturns)
+                                genRegimeACF.(sprintf('regime%d', regime))(lag) = ...
+                                    corr(regimeReturns(1:end-lag), regimeReturns(lag+1:end), 'rows', 'complete');
+                            end
+                        end
+                    end
+                end
+            end
+            
+            % For each path, apply enhanced autocorrelation
+            for p = 1:nPaths
+                pathPrices = nodePaths(:, p);
+                
+                % Calculate returns
+                returns = diff(pathPrices) ./ pathPrices(1:end-1);
+                returns(isnan(returns) | isinf(returns)) = 0;
+                
+                % Initialize enhanced returns
+                enhancedReturns = returns;
+                
+                % Apply autocorrelation enhancement
+                for t = maxLag+1:length(returns)
+                    % Get hour of day
+                    h = hourOfDay(t);
+                    
+                    % Get current regime if available
+                    if exist('ancillaryRegimes', 'var')
+                        currentRegime = ancillaryRegimes(t);
+                    else
+                        currentRegime = 1; % Default regime
+                    end
+                    
+                    % Get generation regime if available
+                    if exist('generationRegimes', 'var')
+                        currentGenRegime = generationRegimes(t);
+                    else
+                        currentGenRegime = 1; % Default regime
+                    end
+                    
+                    % Calculate autocorrelation adjustment
+                    acfAdjustment = 0;
+                    
+                    % Apply hour-of-day conditional ACF
+                    for lag = 1:min(maxLag, t-1)
+                        if h+1 <= size(conditionalACF, 1)
+                            acfAdjustment = acfAdjustment + conditionalACF(h+1, lag) * returns(t-lag);
+                        end
+                    end
+                    
+                    % Apply regime-conditional ACF if available
+                    if exist('regimeACF', 'var') && isfield(regimeACF, sprintf('regime%d', currentRegime))
+                        regimeAcf = regimeACF.(sprintf('regime%d', currentRegime));
+                        
+                        for lag = 1:min(length(regimeAcf), t-1)
+                            acfAdjustment = acfAdjustment + 0.5 * regimeAcf(lag) * returns(t-lag);
+                        end
+                    end
+                    
+                    % Apply generation regime-conditional ACF if available
+                    if exist('genRegimeACF', 'var') && isfield(genRegimeACF, sprintf('regime%d', currentGenRegime))
+                        genRegimeAcf = genRegimeACF.(sprintf('regime%d', currentGenRegime));
+                        
+                        for lag = 1:min(length(genRegimeAcf), t-1)
+                            acfAdjustment = acfAdjustment + 0.5 * genRegimeAcf(lag) * returns(t-lag);
+                        end
+                    end
+                    
+                    % Apply adjustment with dampening to avoid extreme values
+                    enhancedReturns(t) = returns(t) + 0.5 * acfAdjustment;
+                end
+                
+                % Reconstruct prices from enhanced returns
+                enhancedPrices = zeros(size(pathPrices));
+                enhancedPrices(1) = pathPrices(1);
+                
+                for t = 2:length(pathPrices)
+                    enhancedPrices(t) = enhancedPrices(t-1) * (1 + enhancedReturns(t-1));
+                end
+                
+                % Store enhanced path
+                enhancedNodePaths(:, p) = enhancedPrices;
+            end
+        end
+        
+        % Store enhanced node paths
+        enhancedPaths.(nodeName) = enhancedNodePaths;
+    end
+    
+    fprintf(' → Enhanced autocorrelation for %d nodes\n', length(nodeNames));
+end
+
+%% 2. Enhanced Volatility Module
+
+function [enhancedPaths] = enhanceVolatility(paths, historicalData, ancillaryData, generationData, forecastData)
+    % Enhances the volatility patterns of simulated paths using multiple data sources
+    %
+    % Inputs:
+    %   paths - Structure containing simulated price paths
+    %   historicalData - Structure containing historical price data
+    %   ancillaryData - Structure containing ancillary price data
+    %   generationData - Structure containing generation data
+    %   forecastData - Structure containing forecast data
+    %
+    % Outputs:
+    %   enhancedPaths - Structure containing paths with enhanced volatility
+    
+    fprintf('Enhancing volatility patterns...\n');
+    
+    % Get node names
+    nodeNames = fieldnames(paths);
+    nodeNames = setdiff(nodeNames, {'Timestamp'});
+    
+    % Initialize enhanced paths
+    enhancedPaths = paths;
+    
+    % Extract timestamps
+    timestamps = paths.Timestamp;
+    
+    % For each node, enhance volatility
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePaths = paths.(nodeName);
+        
+        % Get dimensions
+        [nIntervals, nPaths] = size(nodePaths);
+        
+        % Initialize enhanced node paths
+        enhancedNodePaths = nodePaths;
+        
+        % Extract historical volatility patterns
+        if isfield(historicalData, nodeName)
+            historicalPrices = historicalData.(nodeName);
+            
+            % Calculate historical returns
+            historicalReturns = diff(historicalPrices) ./ historicalPrices(1:end-1);
+            historicalReturns(isnan(historicalReturns) | isinf(historicalReturns)) = 0;
+            
+            % Extract hour-of-day and day-of-week
+            hourOfDay = hour(timestamps);
+            dayOfWeek = weekday(timestamps);
+            
+            % Create conditional volatility based on hour-of-day
+            conditionalVol = zeros(24, 1);
+            
+            for h = 0:23
+                hourIndices = (hourOfDay(1:end-1) == h);
+                if sum(hourIndices) > 10 % Need sufficient data
+                    hourReturns = historicalReturns(hourIndices);
+                    conditionalVol(h+1) = std(hourReturns, 'omitnan');
+                else
+                    % Use overall volatility if insufficient data
+                    conditionalVol(h+1) = std(historicalReturns, 'omitnan');
+                end
+            end
+            
+            % Normalize conditional volatility
+            if mean(conditionalVol, 'omitnan') > 0
+                conditionalVol = conditionalVol / mean(conditionalVol, 'omitnan');
+            else
+                conditionalVol = ones(24, 1);
+            end
+            
+            % Create day-of-week volatility pattern
+            dowVol = zeros(7, 1);
+            
+            for d = 1:7
+                dowIndices = (dayOfWeek(1:end-1) == d);
+                if sum(dowIndices) > 10 % Need sufficient data
+                    dowReturns = historicalReturns(dowIndices);
+                    dowVol(d) = std(dowReturns, 'omitnan');
+                else
+                    % Use overall volatility if insufficient data
+                    dowVol(d) = std(historicalReturns, 'omitnan');
+                end
+            end
+            
+            % Normalize day-of-week volatility
+            if mean(dowVol, 'omitnan') > 0
+                dowVol = dowVol / mean(dowVol, 'omitnan');
+            else
+                dowVol = ones(7, 1);
+            end
+            
+            % Incorporate ancillary price information if available
+            if exist('ancillaryData', 'var') && ~isempty(ancillaryData)
+                % Extract ancillary price regimes
+                ancillaryRegimes = identifyAncillaryRegimes(ancillaryData, timestamps);
+                
+                % Create regime-conditional volatility
+                regimeVol = struct();
+                regimeTypes = unique(ancillaryRegimes);
+                
+                for r = 1:length(regimeTypes)
+                    regime = regimeTypes(r);
+                    regimeIndices = (ancillaryRegimes(1:end-1) == regime);
+                    
+                    if sum(regimeIndices) > 10 % Need sufficient data
+                        regimeReturns = historicalReturns(regimeIndices);
+                        regimeVol.(sprintf('regime%d', regime)) = std(regimeReturns, 'omitnan');
+                    else
+                        regimeVol.(sprintf('regime%d', regime)) = std(historicalReturns, 'omitnan');
+                    end
+                end
+                
+                % Normalize regime volatility
+                baseVol = std(historicalReturns, 'omitnan');
+                for r = 1:length(regimeTypes)
+                    regime = regimeTypes(r);
+                    if baseVol > 0
+                        regimeVol.(sprintf('regime%d', regime)) = ...
+                            regimeVol.(sprintf('regime%d', regime)) / baseVol;
+                    else
+                        regimeVol.(sprintf('regime%d', regime)) = 1;
+                    end
+                end
+            end
+            
+            % Incorporate generation data if available
+            if exist('generationData', 'var') && ~isempty(generationData)
+                % Extract generation regimes (e.g., high/low/medium)
+                generationRegimes = identifyGenerationRegimes(generationData, timestamps);
+                
+                % Create generation-conditional volatility
+                genRegimeVol = struct();
+                genRegimeTypes = unique(generationRegimes);
+                
+                for r = 1:length(genRegimeTypes)
+                    regime = genRegimeTypes(r);
+                    regimeIndices = (generationRegimes(1:end-1) == regime);
+                    
+                    if sum(regimeIndices) > 10 % Need sufficient data
+                        regimeReturns = historicalReturns(regimeIndices);
+                        genRegimeVol.(sprintf('regime%d', regime)) = std(regimeReturns, 'omitnan');
+                    else
+                        genRegimeVol.(sprintf('regime%d', regime)) = std(historicalReturns, 'omitnan');
+                    end
+                end
+                
+                % Normalize generation regime volatility
+                baseVol = std(historicalReturns, 'omitnan');
+                for r = 1:length(genRegimeTypes)
+                    regime = genRegimeTypes(r);
+                    if baseVol > 0
+                        genRegimeVol.(sprintf('regime%d', regime)) = ...
+                            genRegimeVol.(sprintf('regime%d', regime)) / baseVol;
+                    else
+                        genRegimeVol.(sprintf('regime%d', regime)) = 1;
+                    end
+                end
+            end
+            
+            % Implement GARCH-type volatility model
+            % Estimate GARCH parameters from historical data
+            try
+                % Try to fit GARCH(1,1) model
+                garchModel = garch(1, 1);
+                [garchParams, ~, logL] = estimate(garchModel, historicalReturns);
+                
+                % Extract GARCH parameters
+                omega = garchParams.Constant;
+                alpha = garchParams.GARCH{1};
+                beta = garchParams.ARCH{1};
+                
+                % Check if parameters are valid
+                validGarch = (omega > 0) && (alpha > 0) && (beta > 0) && (alpha + beta < 1);
+            catch
+                % If GARCH fitting fails, use simple volatility model
+                validGarch = false;
+            end
+            
+            % For each path, apply enhanced volatility
+            for p = 1:nPaths
+                pathPrices = nodePaths(:, p);
+                
+                % Calculate returns
+                returns = diff(pathPrices) ./ pathPrices(1:end-1);
+                returns(isnan(returns) | isinf(returns)) = 0;
+                
+                % Initialize enhanced returns and volatility
+                enhancedReturns = returns;
+                volatility = zeros(size(returns));
+                
+                % Initialize base volatility
+                baseVol = std(returns, 'omitnan');
+                if isnan(baseVol) || baseVol == 0
+                    baseVol = 0.01; % Default if volatility calculation fails
+                end
+                
+                % Apply GARCH model if valid
+                if validGarch
+                    % Initialize conditional variance
+                    h = zeros(length(returns), 1);
+                    h(1) = baseVol^2;
+                    
+                    % Calculate GARCH conditional variance
+                    for t = 2:length(returns)
+                        h(t) = omega + alpha * returns(t-1)^2 + beta * h(t-1);
+                    end
+                    
+                    % Convert to volatility
+                    volatility = sqrt(h);
+                else
+                    % Use simple volatility model
+                    volatility = baseVol * ones(size(returns));
+                end
+                
+                % Apply hour-of-day volatility scaling
+                for t = 1:length(returns)
+                    h = hourOfDay(t);
+                    d = dayOfWeek(t);
+                    
+                    % Apply hour-of-day scaling
+                    if h+1 <= length(conditionalVol)
+                        volatility(t) = volatility(t) * conditionalVol(h+1);
+                    end
+                    
+                    % Apply day-of-week scaling
+                    if d <= length(dowVol)
+                        volatility(t) = volatility(t) * dowVol(d);
+                    end
+                    
+                    % Apply ancillary regime scaling if available
+                    if exist('ancillaryRegimes', 'var') && exist('regimeVol', 'var')
+                        currentRegime = ancillaryRegimes(t);
+                        if isfield(regimeVol, sprintf('regime%d', currentRegime))
+                            volatility(t) = volatility(t) * regimeVol.(sprintf('regime%d', currentRegime));
+                        end
+                    end
+                    
+                    % Apply generation regime scaling if available
+                    if exist('generationRegimes', 'var') && exist('genRegimeVol', 'var')
+                        currentGenRegime = generationRegimes(t);
+                        if isfield(genRegimeVol, sprintf('regime%d', currentGenRegime))
+                            volatility(t) = volatility(t) * genRegimeVol.(sprintf('regime%d', currentGenRegime));
+                        end
+                    end
+                end
+                
+                % Generate new returns with enhanced volatility
+                enhancedReturns = returns .* (volatility / baseVol);
+                
+                % Reconstruct prices from enhanced returns
+                enhancedPrices = zeros(size(pathPrices));
+                enhancedPrices(1) = pathPrices(1);
+                
+                for t = 2:length(pathPrices)
+                    enhancedPrices(t) = enhancedPrices(t-1) * (1 + enhancedReturns(t-1));
+                end
+                
+                % Store enhanced path
+                enhancedNodePaths(:, p) = enhancedPrices;
+            end
+        end
+        
+        % Store enhanced node paths
+        enhancedPaths.(nodeName) = enhancedNodePaths;
+    end
+    
+    fprintf(' → Enhanced volatility for %d nodes\n', length(nodeNames));
+end
+
+%% 3. Enhanced Jump Process Module
+
+function [enhancedPaths] = enhanceJumpProcess(paths, historicalData, ancillaryData, generationData, forecastData)
+    % Enhances the jump process of simulated paths using multiple data sources
+    %
+    % Inputs:
+    %   paths - Structure containing simulated price paths
+    %   historicalData - Structure containing historical price data
+    %   ancillaryData - Structure containing ancillary price data
+    %   generationData - Structure containing generation data
+    %   forecastData - Structure containing forecast data
+    %
+    % Outputs:
+    %   enhancedPaths - Structure containing paths with enhanced jumps
+    
+    fprintf('Enhancing jump process...\n');
+    
+    % Get node names
+    nodeNames = fieldnames(paths);
+    nodeNames = setdiff(nodeNames, {'Timestamp'});
+    
+    % Initialize enhanced paths
+    enhancedPaths = paths;
+    
+    % Extract timestamps
+    timestamps = paths.Timestamp;
+    
+    % For each node, enhance jump process
+    for i = 1:length(nodeNames)
+        nodeName = nodeNames{i};
+        nodePaths = paths.(nodeName);
+        
+        % Get dimensions
+        [nIntervals, nPaths] = size(nodePaths);
+        
+        % Initialize enhanced node paths
+        enhancedNodePaths = nodePaths;
+        
+        % Extract historical jump characteristics
+        if isfield(historicalData, nodeName)
+            historicalPrices = historicalData.(nodeName);
+            
+            % Calculate historical returns
+            historicalReturns = diff(historicalPrices) ./ historicalPrices(1:end-1);
+            historicalReturns(isnan(historicalReturns) | isinf(historicalReturns)) = 0;
+            
+            % Calculate volatility
+            volatility = std(historicalReturns, 'omitnan');
+            
+            % Define jump threshold (multiple of volatility)
+            jumpThreshold = 3 * volatility;
+            
+            % Identify jumps
+            positiveJumps = historicalReturns > jumpThreshold;
+            negativeJumps = historicalReturns < -jumpThreshold;
+            
+            % Calculate jump probabilities
+            posJumpProb = sum(positiveJumps) / length(historicalReturns);
+            negJumpProb = sum(negativeJumps) / length(historicalReturns);
+            
+            % Calculate jump sizes
+            posJumpSizes = historicalReturns(positiveJumps);
+            negJumpSizes = abs(historicalReturns(negativeJumps));
+            
+            % Calculate mean jump sizes
+            meanPosJumpSize = mean(posJumpSizes, 'omitnan');
+            meanNegJumpSize = mean(negJumpSizes, 'omitnan');
+            
+            if isnan(meanPosJumpSize) || isempty(meanPosJumpSize)
+                meanPosJumpSize = 0.1;  % Default if no positive jumps
+            end
+            
+            if isnan(meanNegJumpSize) || isempty(meanNegJumpSize)
+                meanNegJumpSize = 0.1;  % Default if no negative jumps
+            end
+            
+            % Extract hour-of-day and day-of-week
+            hourOfDay = hour(timestamps);
+            dayOfWeek = weekday(timestamps);
+            
+            % Create conditional jump probabilities based on hour-of-day
+            hourlyPosJumpProb = zeros(24, 1);
+            hourlyNegJumpProb = zeros(24, 1);
+            
+            for h = 0:23
+                hourIndices = (hour(timestamps(1:end-1)) == h);
+                if sum(hourIndices) > 0
+                    hourlyPosJumpProb(h+1) = sum(positiveJumps & hourIndices) / sum(hourIndices);
+                    hourlyNegJumpProb(h+1) = sum(negativeJumps & hourIndices) / sum(hourIndices);
+                else
+                    hourlyPosJumpProb(h+1) = posJumpProb;
+                    hourlyNegJumpProb(h+1) = negJumpProb;
+                end
+            end
+            
+            % Incorporate ancillary price information if available
+            if exist('ancillaryData', 'var') && ~isempty(ancillaryData)
+                % Extract ancillary price regimes
+                ancillaryRegimes = identifyAncillaryRegimes(ancillaryData, timestamps);
+                
+                % Create regime-conditional jump probabilities
+                regimePosJumpProb = struct();
+                regimeNegJumpProb = struct();
+                regimeTypes = unique(ancillaryRegimes);
+                
+                for r = 1:length(regimeTypes)
+                    regime = regimeTypes(r);
+                    regimeIndices = (ancillaryRegimes(1:end-1) == regime);
+                    
+                    if sum(regimeIndices) > 0
+                        regimePosJumpProb.(sprintf('regime%d', regime)) = ...
+                            sum(positiveJumps & regimeIndices) / sum(regimeIndices);
+                        regimeNegJumpProb.(sprintf('regime%d', regime)) = ...
+                            sum(negativeJumps & regimeIndices) / sum(regimeIndices);
+                    else
+                        regimePosJumpProb.(sprintf('regime%d', regime)) = posJumpProb;
+                        regimeNegJumpProb.(sprintf('regime%d', regime)) = negJumpProb;
+                    end
+                end
+            end
+            
+            % Incorporate generation data if available
+            if exist('generationData', 'var') && ~isempty(generationData)
+                % Extract generation regimes
+                generationRegimes = identifyGenerationRegimes(generationData, timestamps);
+                
+                % Create generation-conditional jump probabilities
+                genRegimePosJumpProb = struct();
+                genRegimeNegJumpProb = struct();
+                genRegimeTypes = unique(generationRegimes);
+                
+                for r = 1:length(genRegimeTypes)
+                    regime = genRegimeTypes(r);
+                    regimeIndices = (generationRegimes(1:end-1) == regime);
+                    
+                    if sum(regimeIndices) > 0
+                        genRegimePosJumpProb.(sprintf('regime%d', regime)) = ...
+                            sum(positiveJumps & regimeIndices) / sum(regimeIndices);
+                        genRegimeNegJumpProb.(sprintf('regime%d', regime)) = ...
+                            sum(negativeJumps & regimeIndices) / sum(regimeIndices);
+                    else
+                        genRegimePosJumpProb.(sprintf('regime%d', regime)) = posJumpProb;
+                        genRegimeNegJumpProb.(sprintf('regime%d', regime)) = negJumpProb;
+                    end
+                end
+            end
+            
+            % For each path, apply enhanced jump process
+            for p = 1:nPaths
+                pathPrices = nodePaths(:, p);
+                
+                % Initialize jump indicators
+                posJumpIndicator = zeros(nIntervals, 1);
+                negJumpIndicator = zeros(nIntervals, 1);
+                
+                % For each interval, determine jump occurrence based on conditional probabilities
+                for t = 1:nIntervals
+                    % Get hour of day
+                    h = hourOfDay(t);
+                    
+                    % Base jump probabilities on hour of day
+                    if h+1 <= length(hourlyPosJumpProb)
+                        basePosProb = hourlyPosJumpProb(h+1);
+                        baseNegProb = hourlyNegJumpProb(h+1);
+                    else
+                        basePosProb = posJumpProb;
+                        baseNegProb = negJumpProb;
+                    end
+                    
+                    % Adjust for ancillary regime if available
+                    if exist('ancillaryRegimes', 'var') && exist('regimePosJumpProb', 'var')
+                        currentRegime = ancillaryRegimes(t);
+                        if isfield(regimePosJumpProb, sprintf('regime%d', currentRegime))
+                            % Blend base probability with regime probability
+                            basePosProb = 0.5 * basePosProb + ...
+                                0.5 * regimePosJumpProb.(sprintf('regime%d', currentRegime));
+                            baseNegProb = 0.5 * baseNegProb + ...
+                                0.5 * regimeNegJumpProb.(sprintf('regime%d', currentRegime));
+                        end
+                    end
+                    
+                    % Adjust for generation regime if available
+                    if exist('generationRegimes', 'var') && exist('genRegimePosJumpProb', 'var')
+                        currentGenRegime = generationRegimes(t);
+                        if isfield(genRegimePosJumpProb, sprintf('regime%d', currentGenRegime))
+                            % Blend base probability with generation regime probability
+                            basePosProb = 0.5 * basePosProb + ...
+                                0.5 * genRegimePosJumpProb.(sprintf('regime%d', currentGenRegime));
+                            baseNegProb = 0.5 * baseNegProb + ...
+                                0.5 * genRegimeNegJumpProb.(sprintf('regime%d', currentGenRegime));
+                        end
+                    end
+                    
+                    % Generate random numbers for jump occurrence
+                    posRand = rand();
+                    negRand = rand();
+                    
+                    % Determine jump occurrences
+                    posJumpIndicator(t) = (posRand < basePosProb);
+                    negJumpIndicator(t) = (negRand < baseNegProb);
+                    
+                    % Ensure we don't have both positive and negative jumps at the same time
+                    if posJumpIndicator(t) && negJumpIndicator(t)
+                        if posRand < negRand
+                            negJumpIndicator(t) = 0;
+                        else
+                            posJumpIndicator(t) = 0;
+                        end
+                    end
+                end
+                
+                % Generate jump sizes
+                posJumpSizes = exprnd(meanPosJumpSize, nIntervals, 1);
+                negJumpSizes = exprnd(meanNegJumpSize, nIntervals, 1);
+                
+                % Apply jumps to prices
+                jumpedPrices = pathPrices;
+                
+                % Apply positive jumps
+                jumpedPrices(posJumpIndicator == 1) = jumpedPrices(posJumpIndicator == 1) .* ...
+                    (1 + posJumpSizes(posJumpIndicator == 1));
+                
+                % Apply negative jumps
+                jumpedPrices(negJumpIndicator == 1) = jumpedPrices(negJumpIndicator == 1) .* ...
+                    (1 - negJumpSizes(negJumpIndicator == 1));
+                
+                % Store jumped prices
+                enhancedNodePaths(:, p) = jumpedPrices;
+            end
+        end
+        
+        % Store enhanced node paths
+        enhancedPaths.(nodeName) = enhancedNodePaths;
+    end
+    
+    fprintf(' → Enhanced jump process for %d nodes\n', length(nodeNames));
+end
+
+%% 4. Integrated Simulation Process
+
+function [simulatedPaths] = runIntegratedSimulation(baselinePaths, historicalData, ancillaryData, generationData, forecastData)
+    % Runs the integrated simulation process with all enhanced components
+    %
+    % Inputs:
+    %   baselinePaths - Structure containing baseline simulated paths
+    %   historicalData - Structure containing historical price data
+    %   ancillaryData - Structure containing ancillary price data
+    %   generationData - Structure containing generation data
+    %   forecastData - Structure containing forecast data
+    %
+    % Outputs:
+    %   simulatedPaths - Structure containing fully enhanced simulated paths
+    
+    fprintf('Running integrated simulation process...\n');
+    
+    % Step 1: Enhance autocorrelation
+    acfEnhancedPaths = enhanceAutocorrelation(baselinePaths, historicalData, ancillaryData, generationData, forecastData);
+    
+    % Step 2: Enhance volatility
+    volEnhancedPaths = enhanceVolatility(acfEnhancedPaths, historicalData, ancillaryData, generationData, forecastData);
+    
+    % Step 3: Enhance jump process
+    jumpEnhancedPaths = enhanceJumpProcess(volEnhancedPaths, historicalData, ancillaryData, generationData, forecastData);
+    
+    % Return final enhanced paths
+    simulatedPaths = jumpEnhancedPaths;
+    
+    fprintf('Integrated simulation process completed.\n');
+end
+
+%% 5. Helper Functions
+
+function [regimes] = identifyAncillaryRegimes(ancillaryData, timestamps)
+    % Identifies market regimes based on ancillary price data
+    %
+    % Inputs:
+    %   ancillaryData - Structure containing ancillary price data
+    %   timestamps - Vector of timestamps for alignment
+    %
+    % Outputs:
+    %   regimes - Vector of regime identifiers for each timestamp
+    
+    % Initialize regimes with default value
+    regimes = ones(length(timestamps), 1);
+    
+    % Check if ancillary data is available
+    if isempty(ancillaryData) || ~isstruct(ancillaryData)
+        return;
+    end
+    
+    % Get ancillary types
+    ancillaryTypes = fieldnames(ancillaryData);
+    
+    % If no ancillary types, return default regimes
+    if isempty(ancillaryTypes)
+        return;
+    end
+    
+    % Create combined ancillary price matrix
+    ancillaryPrices = [];
+    validTypes = {};
+    
+    for i = 1:length(ancillaryTypes)
+        typeName = ancillaryTypes{i};
+        
+        if isfield(ancillaryData.(typeName), 'Price') && ...
+           isfield(ancillaryData.(typeName), 'Timestamp')
+            
+            % Interpolate to match timestamps
+            ancPrice = interp1(datenum(ancillaryData.(typeName).Timestamp), ...
+                               ancillaryData.(typeName).Price, ...
+                               datenum(timestamps), 'linear', 'extrap');
+            
+            ancillaryPrices = [ancillaryPrices, ancPrice];
+            validTypes{end+1} = typeName;
+        end
+    end
+    
+    % If no valid ancillary data, return default regimes
+    if isempty(ancillaryPrices)
+        return;
+    end
+    
+    % Normalize ancillary prices
+    normalizedPrices = zscore(ancillaryPrices);
+    
+    % Use k-means clustering to identify regimes
+    try
+        % Determine optimal number of clusters (2-4)
+        maxClusters = min(4, size(normalizedPrices, 2) + 1);
+        
+        % Use k-means with 3 clusters (low, medium, high)
+        [regimes, ~] = kmeans(normalizedPrices, 3, 'Replicates', 5);
+    catch
+        % If clustering fails, use simple thresholding
+        meanPrice = mean(ancillaryPrices, 1);
+        stdPrice = std(ancillaryPrices, 0, 1);
+        
+        % Calculate average normalized price
+        avgNormPrice = mean(normalizedPrices, 2);
+        
+        % Assign regimes based on thresholds
+        regimes = ones(length(timestamps), 1);  % Default: medium
+        regimes(avgNormPrice < -0.5) = 2;       % Low
+        regimes(avgNormPrice > 0.5) = 3;        % High
+    end
+    
+    fprintf(' → Identified %d ancillary price regimes\n', length(unique(regimes)));
+end
+
+function [regimes] = identifyGenerationRegimes(generationData, timestamps)
+    % Identifies regimes based on generation data
+    %
+    % Inputs:
+    %   generationData - Structure containing generation data
+    %   timestamps - Vector of timestamps for alignment
+    %
+    % Outputs:
+    %   regimes - Vector of regime identifiers for each timestamp
+    
+    % Initialize regimes with default value
+    regimes = ones(length(timestamps), 1);
+    
+    % Check if generation data is available
+    if isempty(generationData) || ~isstruct(generationData)
+        return;
+    end
+    
+    % Check if generation data has required fields
+    if ~isfield(generationData, 'Generation') || ~isfield(generationData, 'Timestamp')
+        return;
+    end
+    
+    % Interpolate generation data to match timestamps
+    try
+        genValues = interp1(datenum(generationData.Timestamp), ...
+                           generationData.Generation, ...
+                           datenum(timestamps), 'linear', 'extrap');
+    catch
+        % If interpolation fails, return default regimes
+        return;
+    end
+    
+    % Calculate statistics
+    meanGen = mean(genValues, 'omitnan');
+    stdGen = std(genValues, 'omitnan');
+    
+    % Define thresholds for regimes
+    lowThreshold = meanGen - 0.5 * stdGen;
+    highThreshold = meanGen + 0.5 * stdGen;
+    
+    % Assign regimes based on thresholds
+    regimes = ones(length(timestamps), 1);  % Default: medium
+    regimes(genValues < lowThreshold) = 2;  % Low
+    regimes(genValues > highThreshold) = 3; % High
+    
+    fprintf(' → Identified %d generation regimes\n', length(unique(regimes)));
+end
